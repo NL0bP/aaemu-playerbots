@@ -265,12 +265,16 @@ impl Bot {
                 &mut rng,
             ));
         }
+        let mut state = BotState::new();
+        if cfg.guild.enabled && !cfg.guild.siege_zones.is_empty() {
+            state.enable_sieges();
+        }
         Bot {
             log: Logger::new(slot.clone()),
             slot,
             entry: Box::new(entry),
             persona,
-            state: BotState::new(),
+            state,
             motion,
             combat: Combat::new(),
             brain,
@@ -603,10 +607,11 @@ impl Bot {
                     } else {
                         self.on_motion_tick();
                     }
+                    let next = self.next_wake(brain);
                     if let Some(end) = self.flush(conn, cancel).await {
                         return end;
                     }
-                    tick.as_mut().reset(Instant::now() + self.next_wake(brain));
+                    tick.as_mut().reset(next);
                 }
                 _ = housekeeping.tick() => {
                     if let Some(quiet) = watch.expired(Instant::now()) {
@@ -694,21 +699,19 @@ impl Bot {
         }
     }
 
-    /// How long the loop sleeps after a tick (`brain`: it was a brain tick, which schedules the
+    /// When the loop wakes after a tick (`brain`: it was a brain tick, which schedules the
     /// next one). See [`next_wake_ms`].
-    fn next_wake(&mut self, brain: bool) -> Duration {
+    fn next_wake(&mut self, brain: bool) -> Instant {
         let now = self.now_ms();
         if brain {
             self.next_brain_ms = now + self.brain_period_ms();
         }
-        let walking_in_view = self.watched && self.motion.is_moving();
-        let at = next_wake_ms(
-            now,
-            self.next_brain_ms,
-            walking_in_view.then_some(self.shared.cfg.bots.move_update_ms),
-            self.motion.wake_in(now),
-        );
-        Duration::from_millis(at - now)
+        let move_due = self
+            .watched
+            .then(|| self.motion.move_due_ms(self.shared.cfg.bots.move_update_ms))
+            .flatten();
+        let at = next_wake_ms(now, self.next_brain_ms, move_due, self.motion.wake_in(now));
+        self.clock + Duration::from_millis(at - 1)
     }
 
     fn on_packet(&mut self, p: &Packet) {
@@ -744,6 +747,12 @@ impl Bot {
                 return;
             }
         };
+        if matches!(ev, ServerEvent::World(WorldEvent::Actabilities(_)))
+            && !self.shared.cfg.behavior.sport_fishing
+            && self.shared.cfg.guild.orders().next().is_none()
+        {
+            return;
+        }
         // (the crops of the bot are not kept as doodads in view: the farm memory follows them)
         if self.shared.cfg.farm.enabled {
             if let ServerEvent::World(w) = &ev {
@@ -758,13 +767,51 @@ impl Bot {
             }
         }
         if let ServerEvent::World(WorldEvent::DoodadsCreated(list)) = &mut ev {
+            self.record_companion_theft(list);
             let world = &self.shared.world;
             list.retain(|d| keep_doodad(world, d));
             if list.is_empty() {
                 return;
             }
         }
+        self.record_hostile_death(&ev);
+        self.record_companion_bloodlust(&ev);
         self.state.apply(&ev);
+        if let ServerEvent::Activity(activity) = &ev {
+            if matches!(
+                activity,
+                aa_proto::sc_activity::ActivityEvent::NearbyHouse(_)
+                    | aa_proto::sc_activity::ActivityEvent::HousePermission { .. }
+                    | aa_proto::sc_activity::ActivityEvent::HouseSold { .. }
+                    | aa_proto::sc_activity::ActivityEvent::HouseDemolished { .. }
+            ) {
+                guild::leases::observe(&mut self.state, &self.shared.cfg.guild, activity);
+            }
+            if self.shared.cfg.guild.enabled
+                && !self.shared.cfg.guild.treasuries.is_empty()
+                && guild::treasury::is_mail(activity)
+            {
+                if let Some(mem) = self.state.guild.get_mut().filter(|mem| mem.log.in_guild()) {
+                    let owner = mem.log.is_owner(self.state.me.char_id);
+                    if let Some(terms) = self
+                        .shared
+                        .cfg
+                        .guild
+                        .treasuries
+                        .get(&mem.log.id.to_string())
+                    {
+                        mem.treasury.observe(
+                            activity,
+                            &mem.log,
+                            owner,
+                            terms.support_enabled(),
+                            now,
+                            |id| self.shared.hub.is_bot_char(id),
+                        );
+                    }
+                }
+            }
+        }
         // (the guild lists the server sends name the guilds that exist: those names are taken)
         if let ServerEvent::Activity(aa_proto::sc_activity::ActivityEvent::Guild(g)) = &ev {
             guild::observe(&self.shared.hub.guilds, g);
@@ -787,6 +834,301 @@ impl Bot {
         self.pin_position(queued, now);
         self.clear_target_after_player_fight();
         self.drain_findings();
+    }
+
+    fn record_hostile_death(&self, event: &ServerEvent) {
+        let ServerEvent::World(WorldEvent::UnitDeath { obj, killer, .. }) = event else {
+            return;
+        };
+        let me = &self.state.me;
+        // Zero hit points arrive before the death packet that names the killer.
+        if me.obj == 0 || (me.dead && *obj != me.obj) || self.combat.duel.in_duel() {
+            return;
+        }
+        if *killer == me.obj {
+            self.record_bounty_kill(*obj);
+        }
+        self.record_pack_death(*obj, *killer);
+        if *obj != me.obj {
+            return;
+        }
+        let Some(attacker) = self.state.units.get(killer) else {
+            return;
+        };
+        if attacker.kind == UnitKind::Npc {
+            self.record_companion_dungeon_defeat(attacker.id);
+            return;
+        }
+        if attacker.kind != UnitKind::Character || attacker.id == me.char_id {
+            return;
+        }
+        if !self.shared.cfg.party.join_player_parties && !self.shared.hub.is_bot_char(attacker.id) {
+            return;
+        }
+        let loss = if self.persona.profile.outlaw < 0.5 {
+            -30
+        } else {
+            -20
+        };
+        self.shared.hub.journal.update(self.entry.id, |j| {
+            j.relationships
+                .update(attacker.id, |r| r.change_trust(loss));
+        });
+    }
+
+    fn record_companion_dungeon_defeat(&self, enemy_template: u32) {
+        if !self.shared.cfg.party.join_player_parties
+            || !self.state.place.in_instance()
+            || self.state.place.loading()
+        {
+            return;
+        }
+        let Some(team) = self.state.team().filter(|team| team.in_team()) else {
+            return;
+        };
+        let world = &self.shared.world;
+        let zone_key = self.state.place.zone_key();
+        let Some(dungeon) = world
+            .dungeons()
+            .iter()
+            .find(|dungeon| u32::from(dungeon.zone_key) == zone_key)
+        else {
+            return;
+        };
+        let Some(enemy) = world.npc(enemy_template) else {
+            return;
+        };
+        let witnesses: smallvec::SmallVec<[u32; 5]> = team
+            .members
+            .iter()
+            .filter(|member| {
+                member.char_id != self.state.me.char_id
+                    && self.state.units.get(&member.obj_id).is_some_and(|unit| {
+                        unit.kind == UnitKind::Character && unit.id == member.char_id
+                    })
+            })
+            .map(|member| member.char_id)
+            .collect();
+        if witnesses.is_empty() {
+            return;
+        }
+        let defeat = crate::journal::DungeonDefeat {
+            dungeon: dungeon.name.clone(),
+            enemy: enemy.name.clone(),
+            enemy_template,
+            at_unix_secs: crate::hub::unix_ms() / 1_000,
+        };
+        self.shared.hub.journal.update(self.entry.id, |journal| {
+            for character in witnesses {
+                journal.relationships.update(character, |record| {
+                    record.last_dungeon_defeat = Some(defeat.clone());
+                });
+            }
+            journal.notes.push_clean(
+                defeat.at_unix_secs,
+                &format!(
+                    "{} defeated me while I was in a party in {}.",
+                    defeat.enemy, defeat.dungeon
+                ),
+            );
+        });
+        self.log.say(format!(
+            "companion: remembered being defeated by {} in {}",
+            defeat.enemy, defeat.dungeon
+        ));
+    }
+
+    fn record_pack_death(&self, object: u32, killer: u32) {
+        let cfg = &self.shared.cfg;
+        if !(cfg.guild.enabled && cfg.pvp.enabled && cfg.pvp.warzone)
+            || !cfg
+                .guild
+                .professions
+                .values()
+                .any(|role| *role == guild::profession::Profession::BountyHunter)
+            || self.state.place.in_instance()
+        {
+            return;
+        }
+        let world = &self.shared.world;
+        let me = &self.state.me;
+        let (victim, faction, pack) = if object == me.obj {
+            (
+                me.char_id,
+                me.faction,
+                goals::trade_run::carried_pack_in(world, &self.state.equipment).unwrap_or_default(),
+            )
+        } else {
+            let Some(unit) = self
+                .state
+                .units
+                .get(&object)
+                .filter(|u| u.kind == UnitKind::Character && u.flags & state::U_PACK != 0)
+            else {
+                return;
+            };
+            (unit.id, unit.faction, self.state.pack_of(object))
+        };
+        if victim == 0 || world.specialty_buyers(pack).is_empty() {
+            return;
+        }
+        let Some(attacker) = self
+            .state
+            .units
+            .get(&killer)
+            .filter(|u| u.kind == UnitKind::Character && u.id != victim && u.id != 0)
+        else {
+            return;
+        };
+        if !pvp::rules::Rules::new(world, cfg, faction).hostile(attacker.faction) {
+            return;
+        }
+        let Some(zone) = world.zone_info_at(attacker.pos[0], attacker.pos[1]) else {
+            return;
+        };
+        let alliance = world.mother_faction(faction);
+        if alliance == 0 {
+            return;
+        }
+        let automatic = object == me.obj || self.shared.hub.is_bot_char(victim);
+        self.shared.hub.bounties.report(
+            crate::hub::unix_ms(),
+            attacker,
+            victim,
+            alliance,
+            zone.group,
+            automatic,
+        );
+        if object == me.obj {
+            if let Some(name) = attacker.name.as_deref() {
+                self.log
+                    .say(format!("bounty: reported {name} for the trade pack ambush"));
+            }
+        }
+    }
+
+    fn record_bounty_kill(&self, object: u32) {
+        let Some(victim) = self
+            .state
+            .units
+            .get(&object)
+            .filter(|u| u.kind == UnitKind::Character)
+        else {
+            return;
+        };
+        let me = &self.state.me;
+        let Some(log) = self.state.guild.log().filter(|log| {
+            log.in_guild() && log.member(me.char_id).is_some() && !log.is_owner(me.char_id)
+        }) else {
+            return;
+        };
+        let cfg = &self.shared.cfg;
+        if cfg.guild.enabled
+            && cfg.guild.professions.get(&log.id.to_string())
+                == Some(&guild::profession::Profession::BountyHunter)
+            && self.shared.hub.bounties.close(
+                crate::hub::unix_ms(),
+                self.shared.world.mother_faction(me.faction),
+                victim.id,
+            )
+        {
+            self.shared.hub.journal.update(self.entry.id, |j| {
+                j.bounties_completed = j.bounties_completed.saturating_add(1);
+                let reward = cfg
+                    .guild
+                    .treasuries
+                    .get(&log.id.to_string())
+                    .map_or(0, |terms| terms.bounty_reward_copper);
+                guild::treasury::note_bounty(j, log.id, reward);
+            });
+        }
+    }
+
+    fn record_companion_bloodlust(&self, event: &ServerEvent) {
+        const BLOODLUST: u32 = 1482;
+        let ServerEvent::World(WorldEvent::BuffCreated {
+            obj,
+            buff_id: BLOODLUST,
+            ..
+        }) = event
+        else {
+            return;
+        };
+        let Some(unit) = self.state.units.get(obj).filter(|u| {
+            u.kind == UnitKind::Character
+                && u.id != self.state.me.char_id
+                && self.state.team().is_some_and(|team| {
+                    team.in_team() && team.members.iter().any(|member| member.char_id == u.id)
+                })
+        }) else {
+            return;
+        };
+        let Some(name) = unit.name.as_deref() else {
+            return;
+        };
+        let at = crate::hub::unix_ms() / 1_000;
+        self.shared.hub.journal.update(self.entry.id, |j| {
+            let mut seen = false;
+            j.relationships.update(unit.id, |r| {
+                seen = r.witnessed_bloodlust(at, self.persona.profile.outlaw);
+            });
+            if seen {
+                j.notes.push_clean(
+                    at,
+                    &format!("Saw {name} turn on Bloodlust while in my party."),
+                );
+            }
+        });
+    }
+
+    fn record_companion_theft(&self, evidence: &[DoodadInfo]) {
+        let Some(team) = self.state.team().filter(|team| team.in_team()) else {
+            return;
+        };
+        if !self.state.me.spawned || self.state.place.loading() {
+            return;
+        }
+        let now = crate::hub::unix_ms() / 1_000;
+        for doodad in evidence {
+            let Some(at) = recent_theft_footprints(doodad, now) else {
+                continue;
+            };
+            let (x, y, z) = doodad.pos;
+            let site = [x, y, z];
+            let Some(actor) = self.state.units.get(&doodad.owner_obj).filter(|actor| {
+                actor.kind == UnitKind::Character
+                    && actor.id == doodad.owner_id
+                    && actor.id != self.state.me.char_id
+                    && state::dist3d(self.state.me.pos, site) <= 30.0
+                    && state::dist3d(actor.pos, site) <= 8.0
+                    && team.members.iter().any(|member| member.char_id == actor.id)
+            }) else {
+                continue;
+            };
+            let Some(name) = actor.name.as_deref() else {
+                continue;
+            };
+            let remembered = self.shared.hub.journal.update(self.entry.id, |journal| {
+                let mut remembered = false;
+                journal.relationships.update(actor.id, |record| {
+                    remembered = record.witnessed_theft(at, self.persona.profile.outlaw);
+                });
+                if remembered {
+                    journal.notes.push_clean(
+                        at,
+                        &format!(
+                            "Saw fresh theft footprints left by {name} while we were in a party."
+                        ),
+                    );
+                }
+                remembered
+            });
+            if remembered {
+                self.log.say(format!(
+                    "companion: remembered theft evidence left by {name}"
+                ));
+            }
+        }
     }
 
     /// A pong: its first field is the bot clock at which the ping left.
@@ -877,7 +1219,13 @@ impl Bot {
         // into a fight); the operator's explicit goals are still obeyed.
         let pack_busy =
             goals::trade_run::carried_pack_in(&self.shared.world, &self.state.equipment).is_some()
-                || self.state.econ.lost_pack().is_some();
+                || self
+                    .state
+                    .econ
+                    .lost_pack()
+                    .is_some_and(|lost| !self.shared.world.specialty_buyers(lost.item).is_empty())
+                || (self.shared.cfg.behavior.sport_fishing
+                    && goals::fish::carried_catch_in(&self.shared.world, &self.state.equipment));
         match &cmd {
             BotCmd::Pause => {
                 self.paused = true;
@@ -896,7 +1244,7 @@ impl Bot {
             BotCmd::ServerLogLine { level, line } => self.on_server_log_line(*level, line),
             BotCmd::Pair(_) | BotCmd::Party(_) if pack_busy => {
                 self.log
-                    .say("carrying a trade pack; not taking a pairing or party");
+                    .say("handling a pack; skipping the pairing or party");
             }
             BotCmd::Goal(_) | BotCmd::GoalWith { .. } | BotCmd::Pair(_) | BotCmd::Party(_) => {
                 self.brain.command(&cmd)
@@ -1075,6 +1423,10 @@ impl Bot {
             || st.travel.busy()
             || st.vehicle.seat().is_some()
             || st.vehicle.boat().is_some()
+            || self
+                .brain
+                .goal()
+                .is_some_and(|goal| goal.kind() == GoalKind::Fish)
             || st.place.in_instance()
             || st.place.loading()
     }
@@ -1493,18 +1845,18 @@ fn failed(e: SessionError, online: Duration, phase: Phase) -> SessionEnd {
 }
 
 /// When the bot loop wakes next (bot clock, ms) after a tick at `now`: at the next brain tick
-/// (`next_brain_ms`), sooner every `move_every_ms` while the bot walks in view of a real player
+/// (`next_brain_ms`), sooner at `move_due_ms` while the bot walks in view of a real player
 /// (the movement update between brain ticks), and for the next packet of a jump (`jump_in`, at
 /// least [`MIN_WAKE_MS`] away). Always after `now`.
 pub fn next_wake_ms(
     now: u64,
     next_brain_ms: u64,
-    move_every_ms: Option<u64>,
+    move_due_ms: Option<u64>,
     jump_in: Option<u64>,
 ) -> u64 {
     let mut at = next_brain_ms;
-    if let Some(every) = move_every_ms {
-        at = at.min(now + every);
+    if let Some(due) = move_due_ms {
+        at = at.min(due);
     }
     if let Some(wait) = jump_in {
         at = at.min(now + wait.max(MIN_WAKE_MS));
@@ -1516,6 +1868,17 @@ pub fn next_wake_ms(
 /// reconnect everyone in the same second.
 fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
     d.mul_f32(0.5 + rng.f32())
+}
+
+fn recent_theft_footprints(doodad: &DoodadInfo, now: u64) -> Option<u64> {
+    // The server creates these two footprints after a successful theft. The creation time
+    // distinguishes fresh evidence from older footprints streamed into view on a walk.
+    let at = u64::from(doodad.plant_time);
+    (matches!(doodad.template, 3313 | 3314)
+        && at != 0
+        && at <= now.saturating_add(2)
+        && now.saturating_sub(at) <= 10)
+        .then_some(at)
 }
 
 /// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it
@@ -1534,6 +1897,30 @@ fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_fresh_footprints_count_as_theft_evidence() {
+        let evidence = DoodadInfo {
+            obj: 3,
+            template: 3313,
+            pos: (14_000.0, 9_000.0, 88.0),
+            owner_obj: 42,
+            parent_obj: 0,
+            phase: 1,
+            owner_id: 12,
+            plant_time: 100,
+            quest_glow: 0,
+            has_loot: false,
+        };
+        assert_eq!(recent_theft_footprints(&evidence, 110), Some(100));
+        assert_eq!(recent_theft_footprints(&evidence, 111), None);
+        assert_eq!(recent_theft_footprints(&evidence, 96), None);
+        let bloodstain = DoodadInfo {
+            template: 877,
+            ..evidence
+        };
+        assert_eq!(recent_theft_footprints(&bloodstain, 100), None);
+    }
 
     /// Sizes of the per-bot structures, printed with `--nocapture` for the memory estimate in
     /// `docs/OPERATING.md`; the asserts keep them from growing unnoticed.
@@ -1582,7 +1969,7 @@ mod tests {
             if now >= next_brain {
                 next_brain = now + 250;
             }
-            let at = next_wake_ms(now, next_brain, Some(125), None);
+            let at = next_wake_ms(now, next_brain, Some(now + 125), None);
             wakes.push(at - now);
             now = at;
         }
@@ -1590,7 +1977,10 @@ mod tests {
         // nobody sees it: the brain tick only
         assert_eq!(next_wake_ms(1_000, 1_250, None, None), 1_250);
         // a jump wakes it for its next packet, but never sooner than the shortest wake
-        assert_eq!(next_wake_ms(1_000, 1_250, Some(125), Some(40)), 1_040);
+        assert_eq!(next_wake_ms(1_000, 1_250, Some(1_125), Some(40)), 1_040);
+        // A brain wake at 1100 cannot move the packet from 1125 to 1225.
+        assert_eq!(next_wake_ms(1_000, 1_100, Some(1_125), None), 1_100);
+        assert_eq!(next_wake_ms(1_100, 1_350, Some(1_125), None), 1_125);
         assert_eq!(
             next_wake_ms(1_000, 1_250, None, Some(0)),
             1_000 + MIN_WAKE_MS

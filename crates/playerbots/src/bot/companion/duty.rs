@@ -30,6 +30,7 @@ use crate::bot::goals::social::{strip_gm, whisper_packet};
 use crate::bot::party::{PartyMem, TeamLog};
 use crate::bot::state::{BotState, ChatIn, UnitKind};
 use crate::hub::unix_ms;
+use crate::journal::Preference;
 
 /// The pause before a yes (a person needs a moment to click), in milliseconds.
 const ACCEPT_PAUSE_MS: (u64, u64) = (1_500, 3_500);
@@ -154,6 +155,20 @@ fn facts(ctx: &Ctx<'_>, running: Option<GoalKind>, other: u32) -> Facts {
     }
 }
 
+fn judge(ctx: &Ctx<'_>, running: Option<GoalKind>, other: u32) -> Result<(), Why> {
+    policy::judge(&facts(ctx, running, other))?;
+    check_trust(ctx, other)
+}
+
+fn check_trust(ctx: &Ctx<'_>, other: u32) -> Result<(), Why> {
+    if ctx.hub.journal.read(ctx.persona.id, |j| {
+        j.relationships.get(other).is_some_and(|r| r.trust <= -40)
+    }) {
+        return Err(Why::Distrusted);
+    }
+    Ok(())
+}
+
 /// What the brain asks every tick. Returns whether the bot should start the companion goal now
 /// (it is in a real player's party and runs nothing it must not drop).
 pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
@@ -211,8 +226,7 @@ fn answer_invitation(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         .filter(|p| p.invite_ms == inv.at_ms);
     let Some(pending) = pending else {
         // first sight of this invitation: a no goes out at once, a yes after a pause
-        let f = facts(ctx, running, inv.from_char);
-        match policy::judge(&f) {
+        match judge(ctx, running, inv.from_char) {
             Err(why) => decline(ctx, &inv, why),
             Ok(()) => {
                 let due_ms = now + jitter(ctx, ACCEPT_PAUSE_MS);
@@ -228,8 +242,7 @@ fn answer_invitation(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         return;
     }
     mem_of(ctx.state).pending = None;
-    let f = facts(ctx, running, inv.from_char);
-    if let Err(why) = policy::judge(&f) {
+    if let Err(why) = judge(ctx, running, inv.from_char) {
         decline(ctx, &inv, why);
         return;
     }
@@ -317,6 +330,7 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
                 let was = m.registered != 0;
                 m.registered = 0;
                 m.hand = (0, 0);
+                m.loot_request_team = 0;
                 m.gone_since_ms = 0;
                 m.leave = false;
                 m.leave_sent_ms = 0;
@@ -347,6 +361,12 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         ctx.now.into_std(),
     );
     let first = registered == 0;
+    if let Some(player) = leader.filter(|&id| id != registered && reserved.is_ok()) {
+        let at = unix_ms() / 1000;
+        ctx.hub.journal.update(bot, |j| {
+            j.relationships.update(player, |r| r.joined_party(at));
+        });
+    }
     let (role_sent, hand, gone_since_ms, leave_asked) = {
         let m = mem_of(ctx.state);
         if reserved.is_ok() {
@@ -398,6 +418,9 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         ctx.send(cs::set_team_member_role(team_id, me, role));
         ctx.log.debug(format!("party: role {role}"));
     }
+    if running == Some(GoalKind::Companion) && ctx.cfg.party.loot_share_requests {
+        request_loot_share(ctx, team_id);
+    }
     if let Some(target) = plan.hand_over {
         let m = mem_of(ctx.state);
         m.hand = (m.hand.0 + 1, now.max(1));
@@ -407,6 +430,29 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
     if let Some(why) = plan.leave {
         leave_team(ctx, team_id, why, running);
     }
+}
+
+fn request_loot_share(ctx: &mut Ctx<'_>, team_id: u32) {
+    if peek(ctx.state).is_some_and(|m| m.loot_request_team == team_id) {
+        return;
+    }
+    let Some(master) = team_of(ctx).and_then(|team| {
+        let char_id = team.loot?.assigning_member()?;
+        if ctx.hub.is_bot_char(char_id) {
+            return None;
+        }
+        team.remote_of(char_id).filter(|member| member.online)
+    }) else {
+        return;
+    };
+    let Some(packet) = whisper_packet(
+        &master.name,
+        "Could you set aside a share of the loot for me when we fight together?",
+    ) else {
+        return;
+    };
+    mem_of(ctx.state).loot_request_team = team_id;
+    ctx.send(packet);
 }
 
 /// The party role of a class: tank, healer, or attacker.
@@ -503,6 +549,19 @@ pub fn forward_chat(ctx: &mut Ctx<'_>, lines: &[ChatIn]) -> SmallVec<[Box<str>; 
         if who.is_empty() || ctx.hub.chat.names.contains(who) {
             continue;
         }
+        if l.kind == chat_type::WHISPER && remember_preference(ctx, who, &l.text) {
+            claimed.push(who.into());
+            continue;
+        }
+        if l.kind == chat_type::WHISPER && ctx.cfg.party.trade_escorts {
+            if let Some((sender, true)) = member_named(ctx, who) {
+                if !ctx.hub.is_bot_char(sender) && super::escort::request(ctx, who, sender, &l.text)
+                {
+                    claimed.push(who.into());
+                    continue;
+                }
+            }
+        }
         let Some(cmd) = command::parse(&l.text) else {
             continue;
         };
@@ -511,6 +570,37 @@ pub fn forward_chat(ctx: &mut Ctx<'_>, lines: &[ChatIn]) -> SmallVec<[Box<str>; 
         }
     }
     claimed
+}
+
+fn remember_preference(ctx: &mut Ctx<'_>, who: &str, text: &str) -> bool {
+    let request = text.trim().to_ascii_lowercase();
+    let preference = if request == "forget preference" {
+        None
+    } else if let Some(activity) = request.strip_prefix("remember ") {
+        let Some(preference) = Preference::parse(activity) else {
+            return false;
+        };
+        Some(preference)
+    } else {
+        return false;
+    };
+    let Some((player, _)) = member_named(ctx, who) else {
+        return false;
+    };
+    if ctx.hub.is_bot_char(player) {
+        return false;
+    }
+    ctx.hub.journal.update(ctx.persona.id, |j| {
+        j.relationships
+            .update(player, |r| r.preference = preference);
+    });
+    let text = match preference {
+        Some(p) => format!("I'll remember you like {}.", p.label()),
+        None => "I've forgotten your activity preference.".to_owned(),
+    };
+    let due = ctx.now_ms + jitter(ctx, REPLY_PAUSE_MS);
+    mem_of(ctx.state).reply(due, who, text);
+    true
 }
 
 /// The member of the bot's team called `who`: character id and whether it leads.
@@ -554,6 +644,7 @@ fn handle(ctx: &mut Ctx<'_>, who: &str, whisper: bool, cmd: Command) -> bool {
         }
         Command::Stay => {
             let m = mem_of(ctx.state);
+            m.escort = None;
             m.mode = Mode::Stay;
             m.come = 0;
             m.dungeon = None;
@@ -598,6 +689,7 @@ fn handle(ctx: &mut Ctx<'_>, who: &str, whisper: bool, cmd: Command) -> bool {
                 reply(ctx, Say::NotYours, "");
                 return whisper;
             }
+            mem_of(ctx.state).escort = None;
             dungeon_request(ctx, who, whisper, &query);
         }
         Command::Invite => {}
@@ -691,9 +783,7 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
         }
     }
     let running = None;
-    let mut f = facts(ctx, running, 0);
-    // (the player's level is unknown to the invitation: whoever whispers is in view or not)
-    f.other_level = ctx
+    let other = ctx
         .state
         .units
         .values()
@@ -703,13 +793,13 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(who))
         })
-        .map(|u| u.level)
-        .filter(|&l| l > 0);
+        .map_or(0, |u| u.id);
+    let mut f = facts(ctx, running, other);
     // (the bot judges itself as the invitee would: only a bot in no team passes)
     f.in_team = false;
     // (a bot inside a dungeon may invite: that is how a player joins the run it leads)
     f.away = false;
-    match policy::judge(&f) {
+    match policy::judge(&f).and_then(|()| check_trust(ctx, other)) {
         Ok(()) => {
             let team_id = team_of(ctx).map_or(0, |t| t.team_id);
             ctx.send(cs::invite_to_team(team_id, true, who));

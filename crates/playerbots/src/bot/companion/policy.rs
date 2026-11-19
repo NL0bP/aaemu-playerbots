@@ -56,6 +56,8 @@ pub enum Why {
     TooMany,
     /// This player's party has as many of our bots as it should.
     FullParty,
+    /// The character has repeatedly attacked this bot.
+    Distrusted,
 }
 
 impl Why {
@@ -68,6 +70,7 @@ impl Why {
             Why::LevelGap => "level gap",
             Why::TooMany => "too many companions",
             Why::FullParty => "party full of bots",
+            Why::Distrusted => "I don't trust that player",
         }
     }
 }
@@ -89,6 +92,8 @@ pub fn busy_goal(kind: GoalKind) -> bool {
             | GoalKind::Warzone
             | GoalKind::Event
             | GoalKind::Sail
+            | GoalKind::Delivery
+            | GoalKind::FieldParty
     )
 }
 

@@ -95,6 +95,9 @@ pub fn market_units(lots: &[Lot], template: u32, grade: u8, me: u32) -> Vec<u32>
 /// out minus the listing fee that was taken up front (copper, can be negative).
 pub fn net_of(buyout: i64, duration: u8) -> i64 {
     let b = buyout.clamp(0, i64::from(i32::MAX));
+    if b == 0 {
+        return 0;
+    }
     let share = (b as f64 * SELLER_SHARE_PCT) as i64;
     share - i64::from(listing_fee(b as i32, duration))
 }
@@ -194,8 +197,29 @@ pub fn heuristic_unit(facts: Facts) -> u32 {
 pub enum Why {
     /// It costs far less than a vendor pays for it.
     Bargain,
+    /// A recent record of completed sales supports buying it for resale.
+    Resale,
     /// The bot can use the item and the lot costs no more than a shop would.
     Useful,
+}
+
+/// Use a discount from observed sales to leave room for competition on the resale.
+pub(crate) fn resale_ask(unit: f32, count: u32, cost: i64) -> Option<Ask> {
+    if !unit.is_finite() || unit <= 0.0 || count == 0 || cost <= 0 {
+        return None;
+    }
+    let buyout = (f64::from(unit) * f64::from(count) * 0.9).floor() as i64;
+    let buyout = i32::try_from(buyout).ok().filter(|&price| price > 0)?;
+    let fee = listing_fee(buyout, aa_proto::auction::duration::H48);
+    let net = net_of(i64::from(buyout), aa_proto::auction::duration::H48);
+    // Fixed-price listings protect the margin even when someone places the minimum bid.
+    (net >= cost + (cost / 5).max(50)).then_some(Ask {
+        start: buyout,
+        buyout,
+        unit: buyout as u32 / count,
+        fee,
+        net,
+    })
 }
 
 /// Whether the bot should buy `lot` out for its buyout price. `facts` are the item's, `useful`
@@ -245,6 +269,17 @@ mod tests {
     }
 
     #[test]
+    fn resale_includes_the_listing_fee_and_requires_a_margin() {
+        let ask = resale_ask(200.0, 10, 1000).unwrap();
+        assert_eq!(
+            (ask.start, ask.buyout, ask.fee, ask.net),
+            (1800, 1800, 72, 1548)
+        );
+        assert!(resale_ask(200.0, 10, 1450).is_none());
+        assert!(resale_ask(f32::NAN, 10, 1000).is_none());
+    }
+
+    #[test]
     fn the_quote_is_the_median_of_the_lowest_few() {
         assert_eq!(quote(&mut []), None);
         assert_eq!(
@@ -291,8 +326,9 @@ mod tests {
         assert_eq!(net_of(1000, duration::H6), 900 - 10);
         assert_eq!(net_of(0, duration::H48), 0);
         assert_eq!(net_of(-3, duration::H48), 0);
-        // the server truncates both
-        assert_eq!(net_of(99, duration::H48), 89 - 3);
+        // The server truncates the seller's share and rounds the fee.
+        assert_eq!(net_of(99, duration::H48), 89 - 4);
+        assert_eq!(net_of(945, duration::H48), 850 - 38);
     }
 
     #[test]
@@ -323,8 +359,8 @@ mod tests {
         let a = ask(facts, 20, Some(q), 97, duration::H48).unwrap();
         assert_eq!(a.buyout, 1940);
         assert_eq!(a.start, 1746);
-        assert_eq!(a.fee, 77);
-        assert_eq!(a.net, 1746 - 77);
+        assert_eq!(a.fee, 78);
+        assert_eq!(a.net, 1746 - 78);
         assert_eq!(a.unit, 97);
         // vendor: 400. Market at 26 each (520): the floor is 503, the bot's 96% would be 499: floor
         let q = Quote {

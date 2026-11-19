@@ -39,11 +39,19 @@ pub mod chat;
 pub mod duty;
 pub mod forming;
 pub mod found;
+pub(crate) mod land;
+pub mod leases;
 pub mod life;
 pub mod log;
 pub mod names;
 pub mod plan;
+pub mod prices;
+pub mod profession;
+pub mod recovery;
 pub mod report;
+pub mod siege;
+pub mod supply;
+pub mod treasury;
 
 use aa_proto::guild::GuildEvent;
 
@@ -59,6 +67,10 @@ pub struct Mem {
     pub log: GuildLog,
     /// The duty's clocks and plans.
     pub t: Timers,
+    pub treasury: treasury::Treasury,
+    pub leases: leases::Book,
+    pub sieges: siege::Book,
+    pub(crate) gather_backoff: crate::bot::goals::work::GatherBackoff,
 }
 
 /// What a bot knows about its guild (one pointer until the first guild packet or duty tick).

@@ -225,6 +225,10 @@ pub trait Services {
     fn llm(&self) -> Option<Arc<pb_llm::Llm>>;
     /// The process-wide chat limits and counters.
     fn gate(&self) -> &gate::ChatGate;
+    /// A structured memory for a private reply to this character.
+    fn companion_memory(&self, _bot: u32, _character: u32) -> Option<String> {
+        None
+    }
 }
 
 impl Services for Hub {
@@ -242,6 +246,32 @@ impl Services for Hub {
 
     fn gate(&self) -> &gate::ChatGate {
         &self.chat.gate
+    }
+
+    fn companion_memory(&self, bot: u32, character: u32) -> Option<String> {
+        self.journal.read(bot, |j| {
+            let record = j.relationships.get(character)?;
+            let activity = record.preference.map_or("unspecified", |p| p.label());
+            let mut memory = format!(
+                "You have partied together {} times. Your trust in this player is {} out of 100. Their stated preferred activity is {}. Use this to suggest an activity when relevant.",
+                record.shared_parties, record.trust, activity
+            );
+            if record.remembers_bloodlust() {
+                memory.push_str(" You saw this player enable Bloodlust while in your party.");
+            }
+            if record.remembers_theft() {
+                memory.push_str(" You saw fresh theft footprints left by this player while in your party.");
+            }
+            if let Some(defeat) = &record.last_dungeon_defeat {
+                use std::fmt::Write;
+                let _ = write!(
+                    memory,
+                    " While in a party with this player, {} defeated you in {}. If they bring up another attempt, suggest regrouping, recovering or filling missing party roles, in a way that fits your personality.",
+                    defeat.enemy, defeat.dungeon
+                );
+            }
+            Some(memory)
+        })
     }
 }
 
@@ -315,6 +345,9 @@ pub fn temperament_text(dominant: &str) -> &'static str {
 
 /// Everything one step looks at.
 pub struct Inputs<'a> {
+    /// Roster id and the party roster, used to resolve a companion's private message.
+    pub bot_id: u32,
+    pub team: Option<&'a crate::bot::party::TeamLog>,
     /// The bot clock in milliseconds.
     pub now_ms: u64,
     /// Wall-clock instant, for the process-wide limits.
@@ -335,8 +368,45 @@ pub struct Inputs<'a> {
     pub style: Style,
     /// Who the bot is.
     pub facts: Facts<'a>,
+    /// A recent server quote while standing at an auctioneer.
+    auction_quote: Option<AuctionRemark<'a>>,
     /// Randomness.
     pub rng: &'a mut fastrand::Rng,
+}
+
+#[derive(Clone, Copy)]
+struct AuctionRemark<'a> {
+    item: &'a str,
+    copper: u32,
+    seen_ms: u64,
+}
+
+fn auction_remark<'a>(ctx: &Ctx<'a>, last_spoken: u64) -> Option<AuctionRemark<'a>> {
+    if !ctx.cfg.behavior.settlement_visits || ctx.state.place.in_instance() || !ctx.real_player_near
+    {
+        return None;
+    }
+    let market = ctx.state.market.get()?;
+    let observed = market
+        .auction
+        .prices()
+        .iter()
+        .filter_map(|entry| {
+            let quote = entry.quote?;
+            if entry.at_ms <= last_spoken || ctx.now_ms.saturating_sub(entry.at_ms) > 3 * 60_000 {
+                return None;
+            }
+            Some(AuctionRemark {
+                item: ctx.world.item_name(entry.template)?,
+                copper: quote.lowest,
+                seen_ms: entry.at_ms,
+            })
+        })
+        .max_by_key(|quote| quote.seen_ms)?;
+    let [x, y, z] = ctx.pos();
+    ctx.world
+        .nearest_auctioneer(aa_world::Vec3::new(x, y, z), 15.0, |_| false)?;
+    Some(observed)
 }
 
 /// A line to put on the wire.
@@ -515,6 +585,7 @@ struct Pending {
 #[derive(Debug, Clone)]
 struct Plan {
     who: String,
+    character: Option<u32>,
     whisper: bool,
     addressed: bool,
     text: String,
@@ -529,6 +600,7 @@ pub struct Social {
     next_scan_ms: u64,
     next_hello_ms: u64,
     next_ambient_ms: u64,
+    last_auction_remark_ms: u64,
     next_channel_ms: u64,
     next_bag_ms: u64,
     llm_off_until_ms: u64,
@@ -679,7 +751,12 @@ impl Social {
         }
         let facts = facts_of(ctx.persona, &ctx.state.me, ctx.world);
         let me = &ctx.state.me;
+        let auction_quote = (ctx.now_ms >= self.next_ambient_ms)
+            .then(|| auction_remark(ctx, self.last_auction_remark_ms))
+            .flatten();
         let mut inp = Inputs {
+            bot_id: ctx.persona.id,
+            team: ctx.state.team(),
             now_ms: ctx.now_ms,
             now: ctx.now.into_std(),
             active: me.spawned && !me.dead,
@@ -690,6 +767,7 @@ impl Social {
             pcfg: &ctx.cfg.personality,
             style: Style::new(&ctx.persona.profile, &ctx.cfg.personality),
             facts,
+            auction_quote,
             rng: &mut *ctx.rng,
         };
         let mut out: SmallVec<[Action; 2]> = SmallVec::new();
@@ -888,6 +966,13 @@ impl Social {
         }
         let plan = Plan {
             who: who.to_string(),
+            character: unit.map(|u| u.id).or_else(|| {
+                inp.team?
+                    .remote
+                    .iter()
+                    .find(|r| r.name.eq_ignore_ascii_case(who))
+                    .map(|r| r.char_id)
+            }),
             whisper,
             addressed,
             text: line.text.to_string(),
@@ -906,12 +991,21 @@ impl Social {
             Some(llm) => {
                 // The newest line is the last one remembered: the player's.
                 let messages = self.mem.messages(&plan.who, now_ms);
-                let request = reply::build_request(
+                let mut request = reply::build_request(
                     &inp.facts.persona_with(inp.style.llm()),
                     &plan.who,
                     plan.whisper,
                     messages,
                 );
+                if plan.whisper {
+                    if let Some(memory) = plan
+                        .character
+                        .and_then(|id| svc.companion_memory(inp.bot_id, id))
+                    {
+                        request.system.push('\n');
+                        request.system.push_str(&memory);
+                    }
+                }
                 let rx = reply::spawn(llm, request);
                 self.pending = Some(Pending {
                     rx,
@@ -1107,6 +1201,29 @@ impl Social {
         if !self.unasked_room(inp) || !gate.take_ambient(inp.now, per_min) {
             return false;
         }
+        if let Some(quote) = inp
+            .auction_quote
+            .filter(|q| q.seen_ms > self.last_auction_remark_ms)
+        {
+            let line = format!(
+                "I just saw {} at the auction house for as little as {} each.",
+                quote.item,
+                super::trade_run::coins(i64::from(quote.copper))
+            );
+            if let Some(text) = filtered(&line, inp.style.level(), &gate.stats) {
+                self.last_auction_remark_ms = quote.seen_ms;
+                self.spoke_unasked(inp);
+                self.due = Some(Due {
+                    at_ms: now + rand_range(inp.rng, CANNED_DELAY_MS),
+                    action: Action::Say(text),
+                    how: Sent::Ambient,
+                    who: "".into(),
+                    told: 0,
+                    joke: false,
+                });
+                return true;
+            }
+        }
         let told = gate.told();
         let tongue = inp.style.tongue();
         let slots = Slots {
@@ -1255,7 +1372,14 @@ fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
     if ctx.state.inbox.is_empty() {
         return;
     }
-    let lines = std::mem::take(&mut ctx.state.inbox);
+    let mut lines = std::mem::take(&mut ctx.state.inbox);
+    lines.retain(|l| {
+        !super::delivery::on_whisper(ctx, l)
+            && !super::mediation::on_whisper(ctx, l)
+            && !super::warzone::bounty_whisper(ctx, l)
+            && !super::work::assignment::on_whisper(ctx, l)
+            && !super::work::customer::on_whisper(ctx, l)
+    });
     // (the market features hear the shout, trade and group-finding channels and the whispers
     // besides us; what they do with them is no business of the routing below)
     let market = &mut ctx.state.market;

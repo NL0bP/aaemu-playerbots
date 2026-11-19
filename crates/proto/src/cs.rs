@@ -713,16 +713,54 @@ pub fn start_skill_position_with(
     start_skill(
         skill_id,
         unit_caster(caster),
-        |s| {
-            s.write_u8(1)
-                .write_i64(fx64(pos.0))
-                .write_i64(fx64(pos.1))
-                .write_f32(pos.2)
-                .write_f32(rotation)
-                .write_bc(0)
-                .write_bc(0);
-        },
+        position_target(pos, rotation),
         object,
+    )
+}
+
+fn position_target(pos: (f32, f32, f32), rotation: f32) -> impl FnOnce(&mut PacketStream) {
+    move |s| {
+        s.write_u8(1)
+            .write_i64(fx64(pos.0))
+            .write_i64(fx64(pos.1))
+            .write_f32(pos.2)
+            .write_f32(rotation)
+            .write_bc(0)
+            .write_bc(0);
+    }
+}
+
+/// A mounted weapon skill aimed at a world position.
+pub fn start_mount_skill_position(
+    skill_id: u32,
+    mount: u32,
+    mount_skills: u32,
+    pos: (f32, f32, f32),
+) -> Out {
+    start_skill(
+        skill_id,
+        |s| {
+            s.write_u8(3).write_bc(mount).write_u32(mount_skills);
+        },
+        position_target(pos, 0.0),
+        &SkillObject::None,
+    )
+}
+
+/// Cast an inventory item's skill at a world position, such as applying chum to a fish school.
+pub fn start_skill_item_at(
+    skill_id: u32,
+    caster: u32,
+    item_id: u64,
+    item_template: u32,
+    pos: (f32, f32, f32),
+    rotation: f32,
+) -> Out {
+    start_skill(
+        skill_id,
+        item_caster(caster, item_id, item_template),
+        position_target(pos, rotation),
+        &SkillObject::None,
     )
 }
 
@@ -1027,6 +1065,11 @@ pub fn gm_command(line: &str) -> Option<Out> {
         && line.chars().count() <= MAX_CHAT_CHARS
         && !line.chars().any(char::is_control);
     ok.then(|| chat_packet(chat_type::SAY, "", line))
+}
+
+/// An ordinary guild member's server-side siege registration.
+pub fn join_siege(zone_group: u16) -> Out {
+    chat_packet(chat_type::SAY, "", &format!("/joinsiege {zone_group}"))
 }
 
 // ---- quests ---------------------------------------------------------------------------------
@@ -1433,6 +1476,26 @@ pub fn create_doodad(
 /// `systems/npcs/public_farm.rs` (`CSRequestCommonFarmList::read`).
 pub fn request_common_farm_list() -> Out {
     game(cs::CSRequestCommonFarmList, |_| {})
+}
+
+/// Express mail with a single copper attachment and no items.
+pub fn send_money_mail(receiver: &str, title: &str, copper: i32, extra: i64, mailbox: u32) -> Out {
+    game(cs::CSSendMailPacket, |s| {
+        s.write_u8(crate::sc_activity::mail_type::EXPRESS)
+            .write_str(receiver)
+            .write_u32(0)
+            .write_str(title)
+            .write_str("Guild contribution")
+            .write_u8(1)
+            .write_i32(copper)
+            .write_i32(0)
+            .write_i32(0)
+            .write_i64(extra);
+        for _ in 0..10 {
+            s.write_u16(0);
+        }
+        s.write_bc(mailbox);
+    })
 }
 
 /// `CSListMailPacket` (empty): opens the mailbox. Server read: `systems/economy/mail_packets.rs:470`.

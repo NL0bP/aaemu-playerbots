@@ -48,6 +48,8 @@ pub struct AgentSlot {
     pub players_near: u16,
     /// The LLM director's plan, the next step first.
     pub plan: Vec<String>,
+    /// The bot's role in a configured guild.
+    pub guild_work: Option<String>,
 }
 
 /// The goal names of `mask`, in [`GoalKind::ALL`] order.
@@ -252,6 +254,7 @@ pub fn observation(g: &SlotInner, journal: &Journal, now_ms: u64) -> pb_web::Obs
         o.mp_pct = a.mp_pct;
         o.eligible = goal_names(a.eligible);
         o.plan = a.plan.clone();
+        o.guild_work = a.guild_work.clone();
         o.nearby = pb_web::Nearby {
             monsters: a.monsters_near,
             characters: u32::from(a.characters_near),
@@ -265,6 +268,38 @@ pub fn observation(g: &SlotInner, journal: &Journal, now_ms: u64) -> pb_web::Obs
         .map(|n| n.text.clone())
         .collect();
     o.zones_seen = journal.seen.zones.len() as u32;
+    o.thief_history = journal.thief_history;
+    o.fish_turn_ins = journal.fish_turn_ins;
+    o.fish_sale_copper = journal.fish_sale_copper;
+    o.delivery_recipient = journal
+        .delivery
+        .as_ref()
+        .filter(|order| order.expires_ms > now_ms)
+        .map(|order| order.recipient_name.clone());
+    o.deliveries_completed = journal.deliveries_completed;
+    o.scouting_reports = journal.scouting_reports;
+    o.escorts_completed = journal.escorts_completed;
+    o.guild_copper_received = journal.guild_copper_received;
+    o.auction_resale_profit = journal.auction_resale_profit;
+    o.relationships = journal
+        .relationships
+        .entries
+        .iter()
+        .map(|r| pb_web::agent::RelationshipView {
+            character: r.character,
+            shared_parties: r.shared_parties,
+            trust: r.trust,
+            preference: r.preference.map(|p| p.label().to_owned()),
+            last_dungeon_defeat: r.last_dungeon_defeat.as_ref().map(|defeat| {
+                pb_web::agent::DungeonDefeatView {
+                    dungeon: defeat.dungeon.to_string(),
+                    enemy: defeat.enemy.to_string(),
+                    enemy_template: defeat.enemy_template,
+                    at_unix_secs: defeat.at_unix_secs,
+                }
+            }),
+        })
+        .collect();
     o
 }
 
@@ -391,9 +426,21 @@ mod tests {
             characters_near: 3,
             players_near: 1,
             plan: vec!["explore Gweonid Forest".into()],
+            guild_work: None,
         };
         let mut j = Journal::default();
         j.seen.add_zone(4);
+        j.relationships.update(7, |record| {
+            record.last_dungeon_defeat = Some(crate::journal::DungeonDefeat {
+                dungeon: "Sharpwind Mines".into(),
+                enemy: "Stonebrother Colossus".into(),
+                enemy_template: 11363,
+                at_unix_secs: 2,
+            });
+        });
+        j.relationships.update(8, |_| {});
+        let saved = serde_json::to_vec(&j).unwrap();
+        let mut j: Journal = serde_json::from_slice(&saved).unwrap();
         for i in 0..12 {
             j.notes.push(i, &format!("note {i}"));
         }
@@ -408,6 +455,12 @@ mod tests {
         assert_eq!(o.notes.len(), OBSERVE_NOTES);
         assert_eq!(o.notes.last().unwrap(), "note 11");
         assert_eq!(o.zones_seen, 1);
+        let defeat = o.relationships[0].last_dungeon_defeat.as_ref().unwrap();
+        assert_eq!(o.relationships[0].character, 7);
+        assert_eq!(defeat.dungeon, "Sharpwind Mines");
+        assert_eq!(defeat.enemy, "Stonebrother Colossus");
+        assert_eq!(defeat.enemy_template, 11363);
+        assert!(o.relationships[1].last_dungeon_defeat.is_none());
         // offline: the bot's own view is stale and left out
         g.snap.activity = pb_web::Activity::Offline;
         let o = observation(&g, &j, 25_500);

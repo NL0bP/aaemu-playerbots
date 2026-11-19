@@ -38,6 +38,19 @@ pub enum SkillNeed {
     NpcGroup(u32, bool),
 }
 
+/// Restoration from an item skill that targets the user.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ItemRecovery {
+    /// Direct health restoration.
+    pub health: bool,
+    /// Direct mana restoration.
+    pub mana: bool,
+    /// Buff that raises health regeneration, or 0.
+    pub health_regen: u32,
+    /// Buff that raises mana regeneration, or 0.
+    pub mana_regen: u32,
+}
+
 /// The use skills of items and the placement rules of those skills.
 #[derive(Debug, Default)]
 pub struct ItemUses {
@@ -48,6 +61,7 @@ pub struct ItemUses {
     /// `quest_monster_group_id -> NPC templates` (`quest_monster_npcs`), the groups a
     /// [`SkillNeed::NpcGroup`] names.
     groups: FxHashMap<u32, Box<[u32]>>,
+    recovery: FxHashMap<u32, ItemRecovery>,
 }
 
 impl ItemUses {
@@ -112,6 +126,51 @@ impl ItemUses {
             v.sort_unstable();
             v.dedup();
         }
+        let mut recovery = FxHashMap::<u32, ItemRecovery>::default();
+        let _ = each_row(
+            conn,
+            "SELECT DISTINCT s.id, e.actual_type FROM skills s
+             JOIN skill_effects se ON se.skill_id = s.id
+             JOIN effects e ON e.id = se.effect_id
+             WHERE s.target_type_id = 0 AND s.target_selection_id = 1
+             AND e.actual_type IN ('HealEffect', 'RestoreManaEffect')",
+            |r| {
+                let skill = r.u32(0);
+                if item_skills.contains(&skill) {
+                    let item = recovery.entry(skill).or_default();
+                    match r.text(1) {
+                        "HealEffect" => item.health = true,
+                        "RestoreManaEffect" => item.mana = true,
+                        _ => {}
+                    }
+                }
+            },
+        );
+        let _ = each_row(
+            conn,
+            "SELECT DISTINCT s.id, b.id, m.unit_attribute_id FROM skills s
+             JOIN skill_effects se ON se.skill_id = s.id
+             JOIN effects e ON e.id = se.effect_id AND e.actual_type = 'BuffEffect'
+             JOIN buff_effects be ON be.id = e.actual_id
+             JOIN buffs b ON b.id = be.buff_id
+             JOIN unit_modifiers m ON m.owner_type = 'Buff' AND m.owner_id = b.id
+             WHERE s.target_type_id = 0 AND s.target_selection_id = 1 AND b.duration > 0
+             AND m.unit_attribute_id IN (11, 12, 67, 68) AND m.value > 0
+             ORDER BY b.id",
+            |r| {
+                let skill = r.u32(0);
+                if item_skills.contains(&skill) {
+                    let item = recovery.entry(skill).or_default();
+                    let slot = match r.u32(2) {
+                        11 | 67 => &mut item.health_regen,
+                        _ => &mut item.mana_regen,
+                    };
+                    if *slot == 0 {
+                        *slot = r.u32(1);
+                    }
+                }
+            },
+        );
         Ok(ItemUses {
             skill: IdMap::build(rows),
             needs: needs
@@ -122,12 +181,20 @@ impl ItemUses {
                 .into_iter()
                 .map(|(g, v)| (g, v.into_boxed_slice()))
                 .collect(),
+            recovery,
         })
     }
 
     /// The skill using item `item` casts, 0 when it has none.
     pub fn skill(&self, item: u32) -> u32 {
         self.skill.get(item).copied().unwrap_or(0)
+    }
+
+    pub fn recovery(&self, item: u32) -> ItemRecovery {
+        self.recovery
+            .get(&self.skill(item))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Where the item use skill `skill` must be cast; empty when it can be cast anywhere.
@@ -153,6 +220,7 @@ impl ItemUses {
     /// Heap bytes held.
     pub fn bytes(&self) -> usize {
         self.skill.shallow_bytes()
+            + self.recovery.capacity() * (std::mem::size_of::<(u32, ItemRecovery)>() + 1)
             + self
                 .needs
                 .values()
@@ -216,5 +284,50 @@ mod tests {
         assert!(u.needs(777).is_empty(), "no item casts skill 777");
         assert!(u.needs(1).is_empty());
         assert!(u.bytes() > 0);
+    }
+
+    #[test]
+    fn item_recovery_reads_direct_effects_and_self_regeneration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INT, use_skill_id INT);
+             CREATE TABLE unit_reqs (id INT, owner_id INT, owner_type TEXT, kind_id INT, value1 INT, value2 INT);
+             CREATE TABLE skills (id INT, target_type_id INT, target_selection_id INT);
+             CREATE TABLE skill_effects (skill_id INT, effect_id INT);
+             CREATE TABLE effects (id INT, actual_type TEXT, actual_id INT);
+             CREATE TABLE buff_effects (id INT, buff_id INT);
+             CREATE TABLE buffs (id INT, duration INT);
+             CREATE TABLE unit_modifiers (owner_type TEXT, owner_id INT, unit_attribute_id INT, value INT);
+             INSERT INTO items VALUES (28554, 22773), (8518, 11718), (1, 100), (2, 101), (3, 102);
+             INSERT INTO skills VALUES (22773, 0, 1), (11718, 0, 1), (100, 5, 2), (101, 0, 1), (102, 0, 1);
+             INSERT INTO skill_effects VALUES (22773, 1), (11718, 2), (100, 1), (101, 3), (102, 4);
+             INSERT INTO effects VALUES (1, 'BuffEffect', 60), (2, 'HealEffect', 0),
+               (3, 'BuffEffect', 61), (4, 'BuffEffect', 62);
+             INSERT INTO buff_effects VALUES (60, 6303), (61, 6304), (62, 6305);
+             INSERT INTO buffs VALUES (6303, 10000), (6304, 10000), (6305, 0);
+             INSERT INTO unit_modifiers VALUES ('Buff', 6303, 67, 15), ('Buff', 6303, 68, 15),
+               ('Buff', 6304, 11, -15), ('Buff', 6304, 8, 15), ('Item', 6304, 12, 15),
+               ('Buff', 6305, 11, 15);",
+        )
+        .unwrap();
+        let uses = ItemUses::load(&conn).unwrap();
+        assert_eq!(
+            uses.recovery(28554),
+            ItemRecovery {
+                health_regen: 6303,
+                mana_regen: 6303,
+                ..ItemRecovery::default()
+            }
+        );
+        assert_eq!(
+            uses.recovery(8518),
+            ItemRecovery {
+                health: true,
+                ..ItemRecovery::default()
+            }
+        );
+        for item in [1, 2, 3] {
+            assert_eq!(uses.recovery(item), ItemRecovery::default());
+        }
     }
 }

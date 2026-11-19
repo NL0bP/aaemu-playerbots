@@ -12,8 +12,11 @@
 //! [`SmallVec`]s with hard limits, strings are kept only where something reads them (character
 //! names).
 
+use std::collections::VecDeque;
+
 use aa_proto::sc::ServerEvent;
 use aa_proto::sc_activity::{quest_status, ActivityEvent, QuestRow};
+use aa_proto::sc_siege;
 use aa_proto::sc_world::{unit_type, EquipSlot, ItemChange, ItemTaskInfo, UnitInfo, WorldEvent};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -29,6 +32,7 @@ use super::zones::ZoneStates;
 
 /// Most units kept in the view.
 pub const MAX_UNITS: usize = 1024;
+const MAX_PENDING_HOUSES: usize = 32;
 /// Most doodads kept in the view.
 pub const MAX_DOODADS: usize = 2048;
 /// `SlotType` of the equipment container in item tasks.
@@ -62,6 +66,16 @@ pub const U_TAG_PARTY: u8 = 32;
 pub const U_TAG_OTHER: u8 = 64;
 /// Mask of the three tag flags.
 pub const U_TAG_MASK: u8 = U_TAG_ME | U_TAG_PARTY | U_TAG_OTHER;
+/// This NPC belongs to this character.
+pub const U_MY_SUMMON: u8 = 128;
+
+#[derive(Debug)]
+pub struct FishCue {
+    pub object: u32,
+    index: u32,
+    pub skill: u32,
+    pub seen_ms: u64,
+}
 
 /// Who the bot saw hit an NPC first (the server's tag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +88,7 @@ pub enum TagOwner {
     Other,
 }
 
-/// What kind of unit the server shows. Houses, transfers, mates and shipyards are not tracked.
+/// What kind of unit the server shows. Only announced siege towers are tracked as housing units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
     /// A player character (a bot or a real player).
@@ -83,6 +97,7 @@ pub enum UnitKind {
     Npc,
     /// A vehicle (cart, boat).
     Slave,
+    Tower,
 }
 
 impl UnitKind {
@@ -92,6 +107,7 @@ impl UnitKind {
             unit_type::CHARACTER => Some(UnitKind::Character),
             unit_type::NPC => Some(UnitKind::Npc),
             unit_type::SLAVE => Some(UnitKind::Slave),
+            unit_type::HOUSING => Some(UnitKind::Tower),
             _ => None,
         }
     }
@@ -192,6 +208,16 @@ struct Held {
     template: u32,
     count: i32,
     grade: u8,
+}
+
+#[derive(Debug, Default)]
+pub struct TreasureMaps {
+    /// Coordinates from the details of treasure maps in the bag, by instance id.
+    pub coordinates: FxHashMap<u64, [i64; 2]>,
+    /// Temporarily inaccessible or missing sites, using the bot clock.
+    pub retry_after: FxHashMap<[i64; 2], u64>,
+    /// Number of item receipts for doodad interactions since the first map arrived.
+    pub loot_receipts: u64,
 }
 
 /// One of the bot's houses.
@@ -435,6 +461,8 @@ pub struct BotState {
     pub doodads: FxHashMap<u32, Doodad>,
     /// Bag content by slot.
     pub bag: FxHashMap<u16, Item>,
+    /// Dig sites, allocated only for a character that has received a coordinate map.
+    pub treasure: Option<Box<TreasureMaps>>,
     /// Equipped items.
     pub equipment: Vec<EquipSlot>,
     /// Quests.
@@ -445,6 +473,8 @@ pub struct BotState {
     pub cooldowns: SmallVec<[(u32, u64); 8]>,
     /// Own buffs `(instance index, buff id)`.
     pub buffs: SmallVec<[(u32, u32); 8]>,
+    /// The latest direction of this character's hooked fish.
+    pub fish_cue: Option<Box<FishCue>>,
     /// Own houses.
     pub houses: SmallVec<[HouseBrief; 1]>,
     /// Units that target the bot `(object id, bot clock ms)`.
@@ -557,6 +587,14 @@ impl BotState {
         BotState::default()
     }
 
+    pub fn enable_sieges(&mut self) {
+        self.guild.mem().sieges.pending_houses = Some(VecDeque::new());
+    }
+
+    fn pending_siege_houses(&mut self) -> Option<&mut VecDeque<UnitInfo>> {
+        self.guild.get_mut()?.sieges.pending_houses.as_mut()
+    }
+
     /// Forgets everything about the world (a new connection starts from scratch) and frees the
     /// memory of the collections.
     pub fn reset(&mut self) {
@@ -572,7 +610,11 @@ impl BotState {
         // (a pack dropped at a death spot is a doodad in the world, not a connection fact: the
         // bot still has to go back for it after a reconnect)
         let lost_pack = self.econ.lost_pack();
+        let sieges_enabled = self.pending_siege_houses().is_some();
         *self = BotState::default();
+        if sieges_enabled {
+            self.enable_sieges();
+        }
         self.vehicle.restore_trip_log(trips);
         self.gear = gear;
         if let Some(lost) = lost_pack {
@@ -758,8 +800,23 @@ impl BotState {
     }
 
     fn apply_world(&mut self, ev: &WorldEvent) {
+        self.vehicle.observe_naval(ev);
         match route(ev) {
-            Route::Travel => return self.travel.on_event(ev, self.me.obj, self.now_ms),
+            Route::Travel => {
+                if let WorldEvent::SkillStarted {
+                    caster_obj,
+                    skill,
+                    result,
+                    ..
+                } = *ev
+                {
+                    if caster_obj != 0 && caster_obj == self.me.obj && result != 0 {
+                        self.push_error(StateError::Skill { skill, result });
+                    }
+                }
+                self.travel.on_event(ev, self.me.obj, self.now_ms);
+                return;
+            }
             Route::Vehicle => {
                 self.vehicle.on_event(ev, self.me.obj);
                 self.travel.on_vehicle_event(ev, self.me.obj, self.now_ms);
@@ -802,8 +859,17 @@ impl BotState {
             }
             WorldEvent::UnitState(info) => self.apply_unit_state(info),
             WorldEvent::UnitsRemoved { objs } => {
+                if let Some(guild) = self.guild.get_mut() {
+                    guild.leases.forget(objs);
+                }
+                if let Some(pending) = self.pending_siege_houses() {
+                    pending.retain(|house| !objs.contains(&house.obj));
+                }
                 for o in objs {
                     self.units.remove(o);
+                    if self.fish_cue.as_ref().is_some_and(|cue| cue.object == *o) {
+                        self.fish_cue = None;
+                    }
                     self.threats.retain(|t| t.0 != *o);
                     if let Some(p) = self.pvp.as_mut() {
                         p.forget(*o);
@@ -885,9 +951,16 @@ impl BotState {
                     if *hp <= 0 {
                         u.flags |= U_DEAD;
                     }
+                } else if let Some(house) = self
+                    .pending_siege_houses()
+                    .and_then(|pending| pending.iter_mut().find(|house| house.obj == *obj))
+                {
+                    house.hp = *hp;
+                    house.dead = *hp <= 0;
                 }
             }
             WorldEvent::UnitDamaged { caster, target } => {
+                super::companion::escort::note_hit(self, *caster, *target);
                 // The first hit the bot sees is the server's tag: the tag decides quest credit,
                 // so a killing blow on a monster somebody else tagged is not counted as one.
                 let bit = if *caster == self.me.obj && self.me.obj != 0 {
@@ -1024,7 +1097,14 @@ impl BotState {
                                 count: it.count,
                             },
                         );
+                        if let Some(coordinates) = it.treasure {
+                            self.treasure
+                                .get_or_insert_with(Box::default)
+                                .coordinates
+                                .insert(it.id, coordinates);
+                        }
                     }
+                    self.prune_treasure_maps();
                     self.market.on_bag_reloaded(&self.bag);
                     if self.gear.is_some() || items.iter().any(|it| it.grade != 0) {
                         self.gear_mut().on_bag(items);
@@ -1080,10 +1160,34 @@ impl BotState {
                     self.buffs.retain(|b| b.0 != *index);
                     self.buffs.push((*index, *buff_id));
                 }
+                if let Some(skill) = super::goals::fish::response_to(*buff_id) {
+                    if self
+                        .units
+                        .get(obj)
+                        .is_some_and(|u| u.flags & U_MY_SUMMON != 0)
+                    {
+                        self.note_fish_cue(*obj, *index, skill);
+                    }
+                }
+                if matches!(
+                    *buff_id,
+                    super::guild::siege::ENGRAVABLE_BUFF | super::guild::siege::ENGRAVING_BUFF
+                ) {
+                    if let Some(guild) = self.guild.get_mut() {
+                        guild.sieges.note_tower_buff(*obj, *buff_id);
+                    }
+                }
             }
             WorldEvent::BuffRemoved { obj, index } => {
                 if *obj == self.me.obj {
                     self.buffs.retain(|b| b.0 != *index);
+                }
+                if self
+                    .fish_cue
+                    .as_ref()
+                    .is_some_and(|cue| (cue.object, cue.index) == (*obj, *index))
+                {
+                    self.fish_cue = None;
                 }
             }
             WorldEvent::Chat {
@@ -1136,6 +1240,13 @@ impl BotState {
     /// ([`Reactions::world_changed`]).
     fn clear_view(&mut self) {
         self.units = FxHashMap::default();
+        if let Some(guild) = self.guild.get_mut() {
+            guild.leases.clear();
+        }
+        if let Some(pending) = self.pending_siege_houses() {
+            pending.clear();
+        }
+        self.fish_cue = None;
         self.doodads = FxHashMap::default();
         self.threats.clear();
         self.kills.clear();
@@ -1146,6 +1257,20 @@ impl BotState {
         }
         if let Some(p) = self.pvp.as_mut() {
             p.clear_view();
+        }
+    }
+
+    fn note_fish_cue(&mut self, object: u32, index: u32, skill: u32) {
+        let update = FishCue {
+            object,
+            index,
+            skill,
+            seen_ms: self.now_ms,
+        };
+        if let Some(cue) = self.fish_cue.as_deref_mut() {
+            *cue = update;
+        } else {
+            self.fish_cue = Some(Box::new(update));
         }
     }
 
@@ -1220,6 +1345,25 @@ impl BotState {
         let Some(kind) = UnitKind::from_wire(info.unit_type) else {
             return;
         };
+        if kind == UnitKind::Tower {
+            let Some(guild) = self
+                .guild
+                .get_mut()
+                .filter(|g| g.sieges.knows_tower(info.obj))
+            else {
+                if let Some(pending) = self.pending_siege_houses() {
+                    pending.retain(|house| house.obj != info.obj);
+                    if pending.len() == MAX_PENDING_HOUSES {
+                        pending.pop_front();
+                    }
+                    pending.push_back(info.clone());
+                }
+                return;
+            };
+            for buff in &info.buffs {
+                guild.sieges.note_tower_buff(info.obj, buff.buff_id);
+            }
+        }
         if self.units.len() >= MAX_UNITS && !self.units.contains_key(&info.obj) {
             self.dropped = self.dropped.saturating_add(1);
             return;
@@ -1233,6 +1377,9 @@ impl BotState {
         }
         if info.owner_id != 0 {
             flags |= U_OWNED;
+            if info.owner_id == self.me.char_id && kind == UnitKind::Npc {
+                flags |= U_MY_SUMMON;
+            }
         }
         if kind == UnitKind::Npc && info.id == aa_world::travel::portal::PORTAL_ENTRANCE_NPC {
             // an open portal's entrance: the portal travel remembers whose gate it is
@@ -1246,6 +1393,20 @@ impl BotState {
         }
         if kind == UnitKind::Character && info.backpack != 0 {
             flags |= U_PACK;
+        }
+        if self
+            .fish_cue
+            .as_ref()
+            .is_some_and(|cue| cue.object == info.obj)
+        {
+            self.fish_cue = None;
+        }
+        if flags & U_MY_SUMMON != 0 {
+            for buff in info.buffs.iter() {
+                if let Some(skill) = super::goals::fish::response_to(buff.buff_id) {
+                    self.note_fish_cue(info.obj, buff.index, skill);
+                }
+            }
         }
         self.units.insert(
             info.obj,
@@ -1400,7 +1561,40 @@ impl BotState {
             self.bag
                 .retain(|_, item| !task.force_removed.contains(&item.id));
         }
+        // DOODAD_INTERACTION (models/item_task.rs). A phase change alone could be another
+        // character taking the chest, so only advance this counter for an inventory receipt.
+        if let Some(treasure) = self.treasure.as_deref_mut().filter(|_| {
+            task.reason == 17
+                && task.changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        ItemChange::Added {
+                            slot_type: SLOT_BAG,
+                            count: 1..,
+                            ..
+                        } | ItemChange::CountUpdate {
+                            slot_type: SLOT_BAG,
+                            delta: 1..,
+                            ..
+                        }
+                    )
+                })
+        }) {
+            treasure.loot_receipts = treasure.loot_receipts.saturating_add(1);
+        }
+        self.prune_treasure_maps();
         self.market.on_item_task(task.reason, &touched, &self.bag);
+    }
+
+    fn prune_treasure_maps(&mut self) {
+        if let Some(treasure) = self.treasure.as_deref_mut() {
+            treasure
+                .coordinates
+                .retain(|id, _| self.bag.values().any(|item| item.id == *id));
+            treasure.retry_after.retain(|position, until| {
+                *until > self.now_ms && treasure.coordinates.values().any(|other| other == position)
+            });
+        }
     }
 
     /// Tells the gear memory about an item change that carries a gear fact (a grade, gems).
@@ -1425,11 +1619,18 @@ impl BotState {
                 id,
                 grade,
                 count,
+                treasure,
                 ..
             } => match slot_type {
                 SLOT_BAG => {
                     // an empty stack is no item: it would hide what the slot held before
                     self.bag_put(u16::from(slot), id, template, count);
+                    if let Some(coordinates) = treasure {
+                        self.treasure
+                            .get_or_insert_with(Box::default)
+                            .coordinates
+                            .insert(id, coordinates);
+                    }
                 }
                 SLOT_EQUIPMENT => {
                     self.equipment.retain(|e| e.slot != slot);
@@ -1694,6 +1895,25 @@ impl BotState {
                     h.build_left = (*all - *cur).max(0);
                 }
             }
+            ActivityEvent::Siege(event) => {
+                if let Some(guild) = self.guild.get_mut() {
+                    let book = &mut guild.sieges;
+                    if book.pending_houses.is_some() {
+                        book.observe(event);
+                    }
+                    if let (Some(pending), sc_siege::Event::Territory { tower, .. }) =
+                        (book.pending_houses.as_mut(), event.as_ref())
+                    {
+                        let house = pending
+                            .iter()
+                            .position(|house| house.obj == *tower)
+                            .and_then(|index| pending.remove(index));
+                        if let Some(house) = house {
+                            self.apply_unit_state(&house);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1808,6 +2028,7 @@ mod tests {
             owner_name: "".into(),
             owner_id: 0,
             tl_id: 0,
+            slave_parent: 0,
             pos: (15010.0, 15100.0, 126.0),
             level: 5,
             hp: 300,
@@ -1843,6 +2064,43 @@ mod tests {
             500,
         )))));
         s
+    }
+
+    #[test]
+    fn a_siege_snapshot_identifies_a_tower_already_announced_in_view() {
+        let mut s = in_world();
+        s.enable_sieges();
+        s.reset();
+        for object in [700, 701] {
+            s.apply(&world(WorldEvent::UnitState(Box::new(unit_info(
+                object,
+                unit_type::HOUSING,
+                192,
+            )))));
+        }
+        assert!(s.units.is_empty());
+        s.apply(&world(WorldEvent::UnitsRemoved {
+            objs: [701].into_iter().collect(),
+        }));
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 700,
+            hp: 8,
+            mp: 0,
+        }));
+        for (group, tower) in [(33, 700), (34, 701)] {
+            s.apply(&ServerEvent::Activity(ActivityEvent::Siege(Box::new(
+                sc_siege::Event::Territory {
+                    group,
+                    tower,
+                    owner: 44,
+                    position: [15010.0, 15100.0, 126.0],
+                    siege: Default::default(),
+                },
+            ))));
+        }
+        assert_eq!(s.unit(700).unwrap().kind, UnitKind::Tower);
+        assert_eq!(s.unit(700).unwrap().hp, 8);
+        assert!(s.unit(701).is_none());
     }
 
     #[test]
@@ -2456,6 +2714,7 @@ mod tests {
                 parent_obj: 0,
                 phase: 1,
                 owner_id: 0,
+                plant_time: 0,
                 quest_glow: 0,
                 has_loot: false,
             }]
@@ -2555,6 +2814,7 @@ mod tests {
                     template: 4045,
                     grade: 0,
                     count: 3,
+                    treasure: None,
                 },
                 InvItem {
                     slot: 7,
@@ -2562,6 +2822,7 @@ mod tests {
                     template: 417,
                     grade: 0,
                     count: 1,
+                    treasure: None,
                 },
             ]),
         }));
@@ -2574,6 +2835,7 @@ mod tests {
                 template: 4045,
                 grade: 0,
                 count: 2,
+                treasure: None,
             }]),
         }));
         // a bank chunk is not the bag
@@ -2586,6 +2848,7 @@ mod tests {
                 template: 1,
                 grade: 0,
                 count: 1,
+                treasure: None,
             }]),
         }));
         assert_eq!(s.bag.len(), 3);
@@ -2616,6 +2879,7 @@ mod tests {
                 id: 99,
                 grade: 0,
                 count: 4,
+                treasure: None,
             },
             ItemChange::Removed {
                 slot_type: SLOT_BAG,
@@ -2716,6 +2980,7 @@ mod tests {
             parent_obj: 0,
             phase: 1,
             owner_id: 0,
+            plant_time: 0,
             quest_glow: 0,
             has_loot: false,
         };
@@ -2788,6 +3053,35 @@ mod tests {
         assert_eq!(s.inbox.len(), before);
     }
 
+    #[test]
+    fn own_skill_refusals_reach_the_action_error_history() {
+        let mut state = in_world();
+        state.now_ms = 37;
+        let answer = |caster_obj, result| {
+            world(WorldEvent::SkillStarted {
+                caster_obj,
+                skill: 13_986,
+                tl: 1,
+                target_obj: 0,
+                result,
+            })
+        };
+        state.apply(&answer(0x500, 34));
+        state.apply(&answer(0x400, 0));
+        assert!(state.errors.is_empty());
+        state.apply(&answer(0x400, 34));
+        assert_eq!(
+            state.errors.as_slice(),
+            &[(
+                37,
+                StateError::Skill {
+                    skill: 13_986,
+                    result: 34,
+                },
+            )]
+        );
+    }
+
     fn chat(kind: i16, n: u32) -> WorldEvent {
         WorldEvent::Chat {
             kind,
@@ -2849,6 +3143,7 @@ mod tests {
                     template: 16401,
                     grade: 0,
                     count: 0,
+                    treasure: None,
                 },
                 InvItem {
                     slot: 3,
@@ -2856,6 +3151,7 @@ mod tests {
                     template: 16401,
                     grade: 0,
                     count: 2,
+                    treasure: None,
                 },
             ]),
         }));
@@ -2884,6 +3180,7 @@ mod tests {
                 id: 14,
                 grade: 0,
                 count: 0,
+                treasure: None,
             }]
             .into_iter()
             .collect(),
@@ -3163,6 +3460,7 @@ mod tests {
                 id: 90,
                 grade: 0,
                 count: 3,
+                treasure: None,
             },
         ];
         let mut s = in_world();
@@ -3229,6 +3527,7 @@ mod tests {
             id,
             grade: 0,
             count,
+            treasure: None,
         };
         let mut s = in_world();
         assert!(s.market.get().is_none(), "no memory before a gain");
@@ -3287,6 +3586,7 @@ mod tests {
                 template: 3411,
                 grade: 0,
                 count: 2,
+                treasure: None,
             }]),
         }));
         assert_eq!(s.market.clean_count(3411), 2);

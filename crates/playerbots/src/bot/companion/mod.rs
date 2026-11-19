@@ -25,6 +25,7 @@
 pub mod command;
 pub mod duty;
 pub mod enter;
+pub mod escort;
 pub mod follow;
 pub mod lead;
 pub mod policy;
@@ -93,6 +94,10 @@ pub struct Mem {
     pub dungeon: Option<u32>,
     /// The bot told the player it arrived at that dungeon's entrance.
     pub dungeon_told: bool,
+    /// Current trade escort offered by the party leader.
+    pub escort: Option<escort::Escort>,
+    /// The escort customer asked to open the payment trade until this bot time.
+    pub escort_payment_until: Option<u64>,
     /// Whispers waiting to be sent.
     pub replies: SmallVec<[Reply; 2]>,
     /// Players who asked for an invitation `(name hash, bot clock)`.
@@ -103,6 +108,8 @@ pub struct Mem {
     pub declined: SmallVec<[(u64, u64); 3]>,
     /// The team the bot announced its role in.
     pub role_sent: u32,
+    /// The current team in which the bot negotiated a share with the loot master.
+    pub loot_request_team: u32,
     /// Attempts to hand the lead over and the bot clock of the last.
     pub hand: (u8, u64),
     /// The team the hand-over was counted for.

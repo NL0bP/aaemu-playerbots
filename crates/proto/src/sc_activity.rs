@@ -220,7 +220,7 @@ pub struct MailHeader {
     pub title: Box<str>,
     /// Sender name.
     pub sender: Box<str>,
-    /// Number of attachments (items; money is in the body).
+    /// Number of item and currency attachments. The amounts are in the body.
     pub attachments: u8,
     /// Receiver name.
     pub receiver: Box<str>,
@@ -646,6 +646,17 @@ pub enum ActivityEvent {
     /// `SCMyHouse`: a house of ours (sent at login and after building or buying one): the
     /// `House.Write` body. G/systems/housing/packets.rs:177-178, G/models/house.rs:95-131.
     MyHouse(Box<HouseInfo>),
+    /// `SCHouseState`: a nearby house and its current owner and permission.
+    NearbyHouse(Box<HouseInfo>),
+    /// The current permission of a house in view.
+    HousePermission {
+        tl: u16,
+        permission: u8,
+    },
+    /// A house changed owners. Wait for a fresh house state before using it again.
+    HouseSold {
+        tl: u16,
+    },
     /// `SCLoginCharInfoHouse`: `u32 owner character`, then the `House.Write` body (character
     /// list). G/systems/housing/packets.rs:179-180, G/systems/housing/ops.rs:55-64.
     LoginCharInfoHouse {
@@ -857,6 +868,7 @@ pub enum ActivityEvent {
     /// A packet about guilds (expeditions): the member list, an invitation, a join or leave, a
     /// role change; see [`crate::guild`].
     Guild(Box<crate::guild::GuildEvent>),
+    Siege(Box<crate::sc_siege::Event>),
 }
 
 type Reader = fn(&mut PacketStream) -> Result<ActivityEvent, MarshalError>;
@@ -1129,6 +1141,14 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         },
         // housing
         sc::SCMyHousePacket => |s| Ok(E::MyHouse(Box::new(HouseInfo::read(s)?))),
+        sc::SCHouseStatePacket => |s| Ok(E::NearbyHouse(Box::new(HouseInfo::read(s)?))),
+        sc::SCHousePermissionChangedPacket => |s| {
+            Ok(E::HousePermission {
+                tl: s.read_u16()?,
+                permission: s.read_u8()?,
+            })
+        },
+        sc::SCHouseSoldPacket => |s| Ok(E::HouseSold { tl: s.read_u16()? }),
         sc::SCLoginCharInfoHousePacket => |s| {
             Ok(E::LoginCharInfoHouse {
                 owner_id: s.read_u32()?,
@@ -1238,6 +1258,9 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
         _ => {
             if let Some(a) = crate::auction::parse(level, opcode, body)? {
                 return Ok(Some(E::Auction(Box::new(a))));
+            }
+            if let Some(event) = crate::sc_siege::parse(level, opcode, body)? {
+                return Ok(Some(E::Siege(Box::new(event))));
             }
             return Ok(crate::guild::parse(level, opcode, body)?.map(|g| E::Guild(Box::new(g))));
         }

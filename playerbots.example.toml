@@ -103,6 +103,16 @@ lifelike = true
 jump_rate = 1.0
 # Emotes (a wave, a bow, a sit) in life-like moments.
 emotes = true
+# Idle bots sometimes visit a friendly auctioneer in a nearby settlement.
+settlement_visits = false
+# Optional world [x, y] coordinates for taverns, campfires or other places to linger.
+settlement_hangouts = []
+# Catch sport fish from active schools and sell the pack at a fish stand.
+sport_fishing = false
+# Accept nearby player whispers for delivery, scouting, and mediation.
+delivery_contracts = false
+# Form nearby bot parties to explore or grind together.
+field_parties = false
 
 [dungeons]
 # Count the server's entry limit (three entries per zone group and four hours) and skip a dungeon
@@ -165,6 +175,10 @@ travel_lookahead_m = 60.0
 # gm_bootstrap or the scroll in the bag. The bigger boats need more room: a cutter is launched
 # from a beach with deep water, sails wide of the coast and berths out at sea.
 ship = "rowboat"
+# Trader guild members can sail an owned boat to a trade buyer on another continent.
+trade_passages = false
+# Thief guild members with an armed hull and Steel Ammo may fire on hostile ships during war.
+naval_raids = false
 
 [mounts]
 # Mounts and gliders: a bot summons the rideable mate of a summon item it owns for a long
@@ -223,6 +237,42 @@ ad_interval_secs = 900
 # Bots in guilds (expeditions): found one together, join one, keep one running (goal "guild").
 # Off until enabled.
 enabled = false
+# Long-run share of autonomous play spent on a configured guild profession (50 to 75).
+work_percent = 60
+# Server guild IDs are strings in these tables. Examples:
+# professions = { "42" = "potato", "43" = "trader", "44" = "crafter", "45" = "gatherer", "46" = "potato" }
+# war_rivals = { "42" = [46] }  # prefer eligible opposing bots whose guild has the same profession
+# fishing_lure_prices = { "45" = 1000 }  # Gatherer guild rank allowance covers up to six sport lures
+# farm_orders = { "42" = 12345 }  # seed or produce item template
+# farm_choices = { "42" = [12345, 12346] }  # seed templates compared using recent sales
+# farm_leases = { "42" = [{ house = 123, rent_copper = 20 }] }  # guild-shared garden by native house ID
+# production_orders = { "44" = { kind = "craft", recipe = 123 } }
+# member_production_orders = { "44" = { "12" = { kind = "craft", recipe = 456, training_recipe = 789 } } }
+# The inner key is a server character ID. Other members keep the guild-wide production order.
+# Nearby players can whisper "craft Stone Brick for 100c" to order one batch of a Crafter's recipe.
+player_craft_orders = false
+auction_flips = false
+treasure_hunts = false
+# trade_pack_orders = { "43" = 6223 }  # a Trader guild's assigned pack recipe and ingredient order
+# treasuries = { "42" = { weekly_dues_copper = 100, commission_percent = 5, reserve_copper = 10000 } }
+# Set weekly_support_copper in the treasury to replenish approved potions and restorative food or drink by trade.
+# Set fund_gear in the treasury to let members spend the same allowance at gear merchants.
+# recovery_supplies = { "42" = [{ item = 8518, unit_copper = 800, stock = 2 }] }
+# A guildmaster can buy a fixed quantity from bots in another configured guild through native trade.
+# Set the buyer's server character ID, treasury and price limit. Use a higher ID for a new contract.
+# supply_contracts = { "42" = { id = 1, buyer_character = 11, supplier = 43, item = 8008, quantity = 20, unit_copper = 50 } }
+# Fund a Crafter guild's active proficiency recipe up to these copper prices per ingredient.
+# The guild must pay rank allowances through its treasury.
+# training_material_prices = { "43" = { "8008" = 50 } }
+# Fund missing tax certificates after the server quotes a Potato guild member's garden claim.
+# farm_tax_prices = { "42" = 10000 }
+# An optional weekly_support_copper amount funds rank-based allowances from collected contributions.
+# bounty_reward_copper can be added to pay for a server-confirmed Bounty Hunter patrol kill.
+# siege_zones = { "42" = [33] }  # join announced sieges as the attacking or defending guild
+# siege_declarations = { "42" = [{ zone_group = 33, position = [22000.0, 24800.0] }] }
+# siege_camp_bids = { "42" = 5000000 }  # optional maximum copper for one camp bid per cycle
+# territory_patrols = { "42" = [{ zone_group = 20, position = [15437.0, 11479.0] }] }
+# rift_patrols = { "42" = [3] }  # patrol the active Crimson Rift during an eligible war
 # Bots may found guilds. false = they only join existing ones.
 found = true
 # A bot founds or joins a guild from this level on.
@@ -287,6 +337,10 @@ join_player_parties = false
 chat_commands = false
 # A bot in a player's party follows it into instance dungeons.
 follow_into_dungeons = false
+# Adventurer guild members accept trade-pack escort requests from their party leader.
+trade_escorts = false
+# For paid escorts, set a price. The leader can whisper "escort accept", then "escort pay" on arrival.
+trade_escort_fee_copper = 0
 # A bot declines the invitation of a player whose level (when known) is more than this far from its own.
 max_level_gap = 10
 # This process has at most this many bots in the parties of real players (more are declined) ...
@@ -352,6 +406,8 @@ growth_rate = 1.0
 public_farms = true
 # Plant on the land of the bot's own houses.
 own_land = true
+# Potato guild members can raise livestock from orders on their gardens or a public ranch.
+husbandry = false
 # Plant the seeds a harvest gives back on the spot the crop stood.
 replant = true
 # The farthest a bot walks to a farm, a vendor or a plot, in metres. With bots.gm_bootstrap and

@@ -36,6 +36,7 @@ use super::ctx::Ctx;
 use super::director::{self, Ask, AskRequest, Decided, Director, Situation, Trigger, What};
 use super::goals::social::{self, ChatEvent, Social};
 use super::goals::{FailReason, Goal, GoalStatus};
+use super::guild::profession::{self, ServiceTime};
 use super::party::{PartyOrder, PartyPurpose};
 use super::state::UnitKind;
 use crate::config::BehaviorCfg;
@@ -139,7 +140,7 @@ fn own_scores(
         super::goals::market::score(ctx, base[market])
     });
     // (the wave-one goals that are not built yet are stubs: 0 until their features exist)
-    let wave_one: [(GoalKind, OwnScore); 8] = [
+    let wave_one: [(GoalKind, OwnScore); 9] = [
         (GoalKind::Guild, super::goals::guild::score),
         (GoalKind::Gank, super::goals::gank::score),
         (GoalKind::Warzone, super::goals::warzone::score),
@@ -148,6 +149,7 @@ fn own_scores(
         (GoalKind::Farm, super::goals::farm::score),
         (GoalKind::Explore, super::goals::explore::score),
         (GoalKind::Gear, super::goals::gear::score),
+        (GoalKind::Siege, super::goals::siege::score),
     ];
     for (kind, score) in wave_one {
         let i = kind.index();
@@ -247,12 +249,16 @@ struct Chat {
     director: Director,
     /// When the agent API's view of the bot is refreshed next (bot clock).
     agent_next_ms: u64,
+    guild_service: ServiceTime,
 }
+
+// The goals after Gear score themselves entirely from the live situation.
+const STORED_BASE_WEIGHTS: usize = GoalKind::Gear as usize + 1;
 
 /// Chooses and runs goals for one bot. See the module docs.
 #[derive(Debug)]
 pub struct Brain {
-    base: [f32; GoalKind::COUNT],
+    base: [f32; STORED_BASE_WEIGHTS],
     goal: Option<Goal>,
     choice: GoalChoice,
     last: Option<GoalKind>,
@@ -280,8 +286,11 @@ pub struct Brain {
 impl Brain {
     /// A brain with the goal weights of `behavior` scaled by the bot's `temper`.
     pub fn new(behavior: &BehaviorCfg, temper: &Temperament) -> Brain {
+        let weights = base_weights(behavior, temper);
+        let mut base = [0.0; STORED_BASE_WEIGHTS];
+        base.copy_from_slice(&weights[..STORED_BASE_WEIGHTS]);
         Brain {
-            base: base_weights(behavior, temper),
+            base,
             goal: None,
             choice: GoalChoice::Auto,
             last: None,
@@ -304,6 +313,7 @@ impl Brain {
                 social: Social::new(rng),
                 director: Director::new(rng, director_interval_secs),
                 agent_next_ms: 0,
+                guild_service: ServiceTime::default(),
             })
         })
     }
@@ -359,12 +369,18 @@ impl Brain {
                 let kind = match order.purpose {
                     PartyPurpose::Dungeon { .. } => GoalKind::Dungeon,
                     PartyPurpose::Guild => GoalKind::Guild,
+                    PartyPurpose::Field(_) => GoalKind::FieldParty,
                     PartyPurpose::Ambush { .. } => GoalKind::Gank,
                 };
                 self.queue(kind, None);
                 self.party = Some(order.clone());
             }
             BotCmd::GoalWith { kind, args } => {
+                if matches!(kind, GoalKind::FieldParty | GoalKind::Fish)
+                    && self.goal.as_ref().is_some_and(|g| g.kind() == *kind)
+                {
+                    return;
+                }
                 self.forced_fails = 0;
                 self.drop_plan();
                 self.queue_with(*kind, args.clone());
@@ -418,13 +434,20 @@ impl Brain {
         super::goals::trade_run::collect_payments(ctx);
         // The same for the mail the auction house sends.
         super::goals::auction::duty(ctx);
+        super::guild::treasury::duty(ctx);
         let combat = Combat::tick(ctx);
         // Mounts and gliders: get off for a fight, summon for a long trip, glide off a ledge.
         super::mount::duty(ctx);
         let now = ctx.now_ms;
         // A pack carrier (or a bot going back for a dropped one) does not take up anything new
         // but its trade run: no market deal, trade, party, event or duel.
-        let pack_busy = super::goals::trade_run::pack_busy(ctx);
+        let pack_busy = super::goals::trade_run::pack_busy(ctx)
+            || super::goals::fish::carries_catch(ctx)
+            || matches!(&self.goal, Some(Goal::TradeRun(run)) if run.checkout_pending())
+            || self
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.kind() == GoalKind::Fish);
 
         self.director_step(ctx);
         self.publish_agent(ctx);
@@ -434,20 +457,38 @@ impl Brain {
         }
         // Market duty: negotiates in the trade chat whatever the bot does; a sale agreed there
         // starts the market goal (the meeting and the trade).
+        let escort_trade =
+            matches!(&self.goal, Some(Goal::Companion(companion)) if companion.handles_trade());
         if !pack_busy
             && super::goals::market::duty(ctx, self.goal.as_ref().map(Goal::kind))
+            && !escort_trade
             && !self.is_disabled(GoalKind::Market)
         {
             self.start_goal(ctx, GoalKind::Market, None);
         }
         // Trade requests no goal asked for are answered here; the house marker follows `houses`.
         // (a pack carrier declines: the run is not interrupted for a trade)
-        if super::goals::trade::unsolicited(
-            ctx,
-            self.goal.as_ref().map(Goal::kind),
-            self.base[GoalKind::Trade.index()],
-            self.is_disabled(GoalKind::Trade) || pack_busy,
-        ) {
+        let running = self.goal.as_ref().map(Goal::kind);
+        let craft_trade = super::goals::work::customer::requested_trade(ctx);
+        if craft_trade
+            && !pack_busy
+            && !ctx.combat.busy()
+            && self.choice == GoalChoice::Auto
+            && matches!(running, None | Some(GoalKind::Rest | GoalKind::Wander))
+            && !self.is_disabled(GoalKind::Work)
+            && !self.cooldown_until.active(GoalKind::Work, now)
+            && self.guild_work_allowed(ctx, GoalKind::Work)
+        {
+            self.start_goal(ctx, GoalKind::Work, None);
+        } else if !escort_trade
+            && !matches!(&self.goal, Some(Goal::Work(work)) if work.handles_trade())
+            && super::goals::trade::unsolicited(
+                ctx,
+                running,
+                self.base[GoalKind::Trade.index()],
+                self.is_disabled(GoalKind::Trade) || pack_busy || craft_trade,
+            )
+        {
             self.start_goal(ctx, GoalKind::Trade, None);
         }
         super::goals::dungeon::unsolicited(ctx, self.goal.as_ref().map(Goal::kind));
@@ -461,6 +502,27 @@ impl Brain {
             && !self.cooldown_until.active(GoalKind::Companion, now)
         {
             self.start_goal(ctx, GoalKind::Companion, None);
+        }
+        if ctx.cfg.party.trade_escorts {
+            let accompanying = self
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.kind() == GoalKind::Companion);
+            let was_escorting = accompanying
+                && self
+                    .ext
+                    .as_ref()
+                    .is_some_and(|ext| ext.guild_service.active());
+            let available = self.guild_service_available(now);
+            let escorting = super::companion::escort::tick(ctx, accompanying, available);
+            if escorting != was_escorting {
+                let service = &mut self.chat(ctx.rng, interval).guild_service;
+                if escorting {
+                    service.start(now);
+                } else {
+                    service.finish(now, ctx.cfg.guild.work_percent);
+                }
+            }
         }
         // Guild duty: answers invitations, recruits, promotes and talks whatever the bot does.
         super::guild::duty(ctx, self.goal.as_ref().map(Goal::kind));
@@ -479,6 +541,20 @@ impl Brain {
             && super::goals::event::duty(ctx, self.goal.as_ref().map(Goal::kind))
         {
             self.start_goal(ctx, GoalKind::Event, None);
+        }
+        if !pack_busy
+            && self.choice == GoalChoice::Auto
+            && self.goal.as_ref().is_some_and(|g| {
+                matches!(
+                    g.kind(),
+                    GoalKind::Companion | GoalKind::Wander | GoalKind::Rest
+                )
+            })
+            && !self.cooldown_until.active(GoalKind::Delivery, now)
+            && self.guild_work_allowed(ctx, GoalKind::Delivery)
+            && super::goals::delivery::ready(ctx)
+        {
+            self.start_goal(ctx, GoalKind::Delivery, None);
         }
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
@@ -535,16 +611,49 @@ impl Brain {
         order: Option<PairOrder>,
         args: Option<Box<GoalArgs>>,
     ) {
+        if args.is_some() && !self.guild_work_allowed(ctx, kind) {
+            ctx.log.debug(format!(
+                "guild work: {} unavailable during personal time",
+                kind.name()
+            ));
+            return;
+        }
         if self.goal.is_some() {
             self.end_goal(ctx, None);
         }
         let party = self.party.take();
+        let forage_leader = kind == GoalKind::FieldParty
+            && party.as_ref().is_some_and(|order| {
+                order.is_leader(ctx.persona.id)
+                    && order.purpose
+                        == super::party::PartyPurpose::Field(super::party::FieldActivity::Forage)
+            });
+        let work_available = self.guild_service_available(ctx.now_ms);
+        let territory_work =
+            kind == GoalKind::Warzone && super::goals::warzone::territory_patrol_ready(ctx);
+        let naval_work = kind == GoalKind::Sail && super::goals::sail::naval_ready(ctx);
+        if (forage_leader || territory_work || naval_work) && !work_available {
+            return;
+        }
         let why = args.as_ref().and_then(|a| a.why.clone());
         let mut goal = Goal::with_args(kind, order, party, args);
+        if let Goal::FieldParty(field) = &mut goal {
+            field.permit_forage(work_available);
+        }
         goal.start(ctx);
         match why {
             Some(why) => ctx.log.say(format!("goal: {} ({why})", kind.name())),
             None => ctx.log.say(format!("goal: {}", kind.name())),
+        }
+        let professional = profession::membership(ctx).is_some_and(|(_, profession, master)| {
+            !master
+                && (profession.goals().contains(&kind)
+                    || kind == GoalKind::Delivery && super::goals::delivery::scouting(ctx))
+        });
+        if professional || forage_leader || territory_work || naval_work || kind == GoalKind::Siege
+        {
+            let interval = ctx.cfg.llm.director_interval_secs;
+            self.chat(ctx.rng, interval).guild_service.start(ctx.now_ms);
         }
         self.goal = Some(goal);
     }
@@ -563,6 +672,8 @@ impl Brain {
         super::travel::on_goal_end(ctx);
         self.last = Some(kind);
         if let Some(ext) = self.ext.as_mut() {
+            ext.guild_service
+                .finish(ctx.now_ms, ctx.cfg.guild.work_percent);
             ext.director.note_goal(kind, why.is_none());
             if why.is_none() {
                 match kind {
@@ -628,7 +739,11 @@ impl Brain {
         let kind = match choose(&s, ctx.rng) {
             Some(kind) => kind,
             // (everything but the run is blocked: wait out its cooldown without wandering off)
-            None if super::goals::trade_run::pack_busy(ctx) => GoalKind::Rest,
+            None if super::goals::trade_run::pack_busy(ctx)
+                || super::goals::fish::carries_catch(ctx) =>
+            {
+                GoalKind::Rest
+            }
             None => GoalKind::Wander,
         };
         self.start_goal(ctx, kind, None);
@@ -639,8 +754,22 @@ impl Brain {
     fn scores_now(&self, ctx: &Ctx<'_>) -> [f32; GoalKind::COUNT] {
         let mut blocked = self.disabled | self.gated_goals(ctx);
         // (asked again here: the gate answer is cached, a pack can start or end in between)
-        if super::goals::trade_run::pack_busy(ctx) {
+        let pack_busy = super::goals::trade_run::pack_busy(ctx);
+        let fish_busy = super::goals::fish::carries_catch(ctx);
+        if pack_busy {
             blocked |= super::goals::trade_run::pack_block_mask();
+        }
+        if fish_busy {
+            blocked |= !(1 << GoalKind::Fish.index());
+        }
+        if !self.guild_service_available(ctx.now_ms) {
+            blocked |= 1 << GoalKind::Siege.index();
+            if super::goals::warzone::territory_patrol_ready(ctx) {
+                blocked |= 1 << GoalKind::Warzone.index();
+            }
+            if super::goals::sail::naval_ready(ctx) {
+                blocked |= 1 << GoalKind::Sail.index();
+            }
         }
         for g in GoalKind::ALL {
             if self.cooldown_until.active(g, ctx.now_ms) {
@@ -654,11 +783,311 @@ impl Brain {
             last: self.last,
             blocked,
         };
-        let mut s = scores(&self.base, &input);
-        own_scores(ctx, &self.base, blocked, &mut s);
+        let mut base = [0.0; GoalKind::COUNT];
+        base[..STORED_BASE_WEIGHTS].copy_from_slice(&self.base);
+        let mut s = scores(&base, &input);
+        own_scores(ctx, &base, blocked, &mut s);
+        let work = GoalKind::Work.index();
+        s[work] = own_score(blocked, work, || super::goals::work::score(ctx));
+        let fish = GoalKind::Fish.index();
+        s[fish] = own_score(blocked, fish, || super::goals::fish::score(ctx));
+        let delivery = GoalKind::Delivery.index();
+        s[delivery] = own_score(blocked, delivery, || {
+            if self.guild_work_allowed(ctx, GoalKind::Delivery)
+                && super::goals::delivery::ready(ctx)
+            {
+                10.0
+            } else {
+                0.0
+            }
+        });
+        let field = GoalKind::FieldParty.index();
+        s[field] = own_score(blocked, field, || {
+            if super::goals::field::ready(ctx) {
+                0.3 + 0.8 * super::goals::field::cooperation(ctx)
+            } else {
+                0.0
+            }
+        });
         // the population director's goal multipliers (all 1.0 unless its policy sets some)
         ctx.hub.pop.bias.apply(&mut s);
+        if let Some((_, role, master)) = profession::membership(ctx) {
+            let available = !master && self.guild_service_available(ctx.now_ms);
+            for kind in role.goals() {
+                if !(pack_busy && *kind == GoalKind::TradeRun
+                    || fish_busy && *kind == GoalKind::Fish)
+                {
+                    s[kind.index()] *= if available { 2.0 } else { 0.0 };
+                }
+            }
+        }
         s
+    }
+
+    fn guild_service_available(&self, now: u64) -> bool {
+        self.ext
+            .as_ref()
+            .is_none_or(|ext| ext.guild_service.available(now))
+    }
+
+    fn guild_work_allowed(&self, ctx: &Ctx<'_>, kind: GoalKind) -> bool {
+        if kind == GoalKind::TradeRun && super::goals::trade_run::pack_busy(ctx) {
+            return true;
+        }
+        if kind == GoalKind::Fish && super::goals::fish::carries_catch(ctx) {
+            return true;
+        }
+        if kind == GoalKind::Delivery && super::goals::delivery::scouting(ctx) {
+            return self.guild_service_available(ctx.now_ms);
+        }
+        if kind == GoalKind::Siege {
+            return self.guild_service_available(ctx.now_ms);
+        }
+        if kind == GoalKind::Sail && super::goals::sail::naval_ready(ctx) {
+            return self.guild_service_available(ctx.now_ms);
+        }
+        if kind == GoalKind::Warzone && super::goals::warzone::territory_patrol_ready(ctx) {
+            return self.guild_service_available(ctx.now_ms);
+        }
+        profession::membership(ctx).is_none_or(|(_, profession, master)| {
+            !profession.goals().contains(&kind)
+                || (!master && self.guild_service_available(ctx.now_ms))
+        })
+    }
+
+    fn guild_work_context(&self, ctx: &Ctx<'_>) -> Option<String> {
+        let siege = super::guild::siege::context(ctx);
+        let Some((id, role, master)) = profession::membership(ctx) else {
+            return siege;
+        };
+        let state = if master {
+            "guildmaster"
+        } else if self
+            .ext
+            .as_ref()
+            .is_some_and(|ext| ext.guild_service.active())
+        {
+            "on guild duty"
+        } else if self.guild_service_available(ctx.now_ms) {
+            "available for guild work"
+        } else {
+            "personal time"
+        };
+        let mut context = format!("Guild {id}, {} profession, {state}.", role.title());
+        let rivals = profession::war_rivals(ctx);
+        if !rivals.is_empty() {
+            context.push_str(&format!(
+                " We prioritize eligible rivals from guilds {rivals:?} on war patrols."
+            ));
+        }
+        if let Some(order) = super::goals::fish::supplies::shopping(ctx) {
+            context.push_str(&format!(
+                " The rank allowance can buy {} sport fishing lures on the market.",
+                order.qty
+            ));
+        }
+        if let Some(siege) = siege {
+            context.push(' ');
+            context.push_str(&siege);
+        }
+        if let Some(item) = profession::farm_order(ctx) {
+            context.push_str(&format!(
+                " The farm goal tends ripe crops and plants item {item}."
+            ));
+        }
+        if role == profession::Profession::Potato && !master {
+            let gardens = super::guild::leases::available(ctx.state, &ctx.cfg.guild).count();
+            if gardens != 0 {
+                context.push_str(&format!(
+                    " The guild has {gardens} leased gardens available nearby."
+                ));
+            }
+        }
+        if role == profession::Profession::Potato && !master && ctx.cfg.farm.husbandry {
+            let actions = ctx
+                .hub
+                .journal
+                .read(ctx.persona.id, |j| j.livestock_actions);
+            context.push_str(&format!(
+                " Confirmed livestock care and collection actions: {actions}."
+            ));
+        }
+        if let Some(order) = super::goals::work::assignment::order(ctx, id) {
+            let (done, training) = ctx.hub.journal.read(ctx.persona.id, |j| {
+                (j.production_completed, j.production_training_completed)
+            });
+            context.push_str(&format!(
+                " Production order: {order}. Lifetime orders completed: {done}. Training crafts: {training}."
+            ));
+        }
+        if master && ctx.cfg.guild.dispatch_orders {
+            let syntax = match role {
+                profession::Profession::Crafter => {
+                    Some("guild work craft <recipe> [training-recipe]")
+                }
+                profession::Profession::Gatherer => Some("guild work gather <doodad> <item>"),
+                profession::Profession::Adventurer => Some("guild work hunt <item> <quantity>"),
+                _ => None,
+            };
+            if let Some(syntax) = syntax {
+                context.push_str(&format!(" To assign production, whisper a guild member bot '{syntax}'. Whisper 'guild work clear' to restore its configured order."));
+            }
+        }
+        if let Some(order) = super::goals::work::customer::summary(ctx) {
+            context.push_str(&order);
+        }
+        if let Some(payment) = super::companion::escort::payment::summary(ctx) {
+            context.push_str(&payment);
+        }
+        if master {
+            if let Some(contract) = super::guild::supply::summary(ctx, id) {
+                context.push_str(&contract);
+            }
+        }
+        if let Some(allowance) = super::goals::work::training::Allowance::for_order(
+            ctx,
+            super::goals::work::selected_order(ctx),
+        ) {
+            context.push_str(&format!(
+                " Rank allowance for approved training materials: {} copper available.",
+                allowance.copper
+            ));
+        }
+        if let Some(need) = super::guild::land::shopping(ctx) {
+            context.push_str(&format!(
+                " The server quoted a garden claim. Rank allowances can fund {} more tax certificates.",
+                need.qty
+            ));
+        }
+        for (item, stock) in super::guild::recovery::stock(ctx) {
+            let count = ctx.state.item_count(item);
+            let name = ctx.world.item_name(item).unwrap_or("recovery items");
+            context.push_str(&format!(" Recovery supplies: {count} of {stock} {name}."));
+        }
+        if let Some(recipe) = profession::trade_pack_order(ctx).and_then(|id| ctx.world.craft(id)) {
+            let pack = ctx
+                .world
+                .item_name(recipe.product.0)
+                .unwrap_or("trade pack");
+            let missing = recipe
+                .materials
+                .iter()
+                .filter(|&&(item, count)| ctx.state.item_count(item) < i64::from(count))
+                .count();
+            context.push_str(&format!(
+                " The guild assigned recipe {} ({pack}). Missing ingredients: {missing} kinds.",
+                recipe.id
+            ));
+        }
+        if ctx.cfg.guild.treasuries.contains_key(&id.to_string()) {
+            ctx.hub.journal.read(ctx.persona.id, |j| {
+                if master {
+                    let week = crate::hub::unix_ms() / super::guild::treasury::WEEK_MS;
+                    let current = j.guild_treasury.get(&id).map_or(0, |a| a.current_contributions(week));
+                    context.push_str(&format!(
+                        " Guild contributors paid {} copper into the guildmaster's purse, including {current} copper this week.",
+                        j.guild_copper_received
+                    ));
+                } else if let Some(a) = j.guild_treasury.get(&id) {
+                    context.push_str(&format!(
+                        " Unpaid guild commission and rent total {} copper. Guild rank allowances received: {} copper.",
+                        a.unpaid_commission, a.support_received
+                    ));
+                    if a.support_supplies_spent > 0 {
+                        context.push_str(&format!(" I spent {} of my rank allowance on supplies.", a.support_supplies_spent));
+                    }
+                    if a.support_gear_spent > 0 {
+                        context.push_str(&format!(" I spent {} of my rank allowance on gear.", a.support_gear_spent));
+                    }
+                    let pending = a.bounty_earned.saturating_sub(a.bounty_paid);
+                    if pending > 0 {
+                        context.push_str(&format!(" I earned {pending} copper in bounty rewards awaiting collection."));
+                    }
+                    if a.loan.principal > 0 {
+                        context.push_str(&format!(
+                            " I owe {} copper on my trade pack advance, including {} reserved for repayment.",
+                            a.loan.principal, a.loan.repayment
+                        ));
+                    }
+                }
+            });
+        }
+        if role == profession::Profession::BountyHunter && !master {
+            let completed = ctx
+                .hub
+                .journal
+                .read(ctx.persona.id, |j| j.bounties_completed);
+            context.push_str(&format!(" Confirmed bounty patrol kills: {completed}."));
+            if let Some(case) = super::goals::warzone::bounty(ctx, |c| ctx.state.at_war(c.group)) {
+                context.push_str(&format!(
+                    " A trade runner reported {} in war zone group {}.",
+                    case.name, case.group
+                ));
+            }
+        }
+        if role == profession::Profession::Trader {
+            if ctx.cfg.sail.trade_passages {
+                if let Some(buyer) = ctx.cfg.guild.voyage_buyers.get(&id.to_string()) {
+                    context.push_str(&format!(" Priority sea shipment to pack buyer {buyer} when an owned boat and a safe route are available."));
+                }
+            }
+            ctx.hub.journal.read(ctx.persona.id, |j| {
+                if ctx.cfg.guild.auction_flips {
+                    context.push_str(&format!(
+                        " Collected auction resale profit: {} copper.",
+                        j.auction_resale_profit
+                    ));
+                }
+                let mut shown = smallvec::SmallVec::<[u32; 4]>::new();
+                let now = crate::hub::unix_ms();
+                for sale in &j.market_sales {
+                    if shown.len() == 4 {
+                        break;
+                    }
+                    if !shown.contains(&sale.item) {
+                        if let Some(price) = ctx.hub.market_prices.average(sale.item, now) {
+                            context.push_str(&format!(
+                                " Recent sales of item {} averaged {:.1} copper per unit.",
+                                sale.item, price
+                            ));
+                            shown.push(sale.item);
+                        }
+                    }
+                }
+            });
+        }
+        if super::goals::work::treasure::allowed(ctx) {
+            let chests = ctx.hub.journal.read(ctx.persona.id, |j| j.treasure_chests);
+            let maps = ctx
+                .state
+                .treasure
+                .as_deref()
+                .map_or(0, |t| t.coordinates.len());
+            context.push_str(&format!(
+                " Treasure chests looted: {chests}. Coordinate maps in my bag: {maps}."
+            ));
+        }
+        if role == profession::Profession::Thief {
+            ctx.hub.journal.read(ctx.persona.id, |j| {
+                if ctx.cfg.sail.naval_raids {
+                    context.push_str(&format!(
+                        " Confirmed cannon hits on enemy ships: {}.",
+                        j.naval_hits
+                    ));
+                }
+                for raid in j.raid_sites.iter().take(3) {
+                    let [x, y] = raid.position;
+                    context.push_str(&format!(
+                        " Previous ambushes near {x:.0}, {y:.0} recovered {} packs.",
+                        raid.recovered
+                    ));
+                }
+            });
+            if super::goals::sail::naval_ready(ctx) {
+                context.push_str(" I have an armed ship and Steel Ammo for a naval raid.");
+            }
+        }
+        Some(context)
     }
 
     /// The goals [`gate`] blocks, asked again when the last answer is old or the level changed.
@@ -692,12 +1121,12 @@ impl Brain {
 
     /// The goals the director may offer or apply right now.
     fn eligible(&self, ctx: &Ctx<'_>) -> director::Goals {
-        director::eligible_goals(&self.scores_now(ctx), ctx.gm_allowed())
+        director::eligible_goals(&self.scores_now(ctx))
     }
 
     /// [`Brain::eligible`] with the scores, best first.
     fn eligible_scored(&self, ctx: &Ctx<'_>) -> director::Scored {
-        director::eligible_scored(&self.scores_now(ctx), ctx.gm_allowed())
+        director::eligible_scored(&self.scores_now(ctx))
     }
 
     // ---- the director ------------------------------------------------------------------
@@ -786,7 +1215,7 @@ impl Brain {
             .filter(|u| u.kind == UnitKind::Character && u.dist2d(me.pos) <= 60.0)
             .count();
         let facts = social::facts(ctx);
-        let situation = director::describe(&Situation {
+        let mut situation = director::describe(&Situation {
             facts,
             level: me.level,
             hp_pct: me.hp_pct(),
@@ -802,6 +1231,31 @@ impl Brain {
             notes: &notes,
             why_now: why_now.as_deref(),
         });
+        if let Some(guild) = self.guild_work_context(ctx) {
+            situation.push_str(&guild);
+            situation.push('\n');
+        }
+        if scored.iter().any(|&(goal, _)| goal == GoalKind::Fish) {
+            use std::fmt::Write;
+            hub.journal.read(id, |j| {
+                let _ = writeln!(
+                    situation,
+                    "Sport fishing history: {} catches sold for {} copper in total.",
+                    j.fish_turn_ins, j.fish_sale_copper
+                );
+            });
+        }
+        if scored.iter().any(|&(goal, _)| goal == GoalKind::TradeRun) {
+            use std::fmt::Write;
+            hub.journal.read(id, |j| {
+                for route in j.trade_routes.iter().take(3) {
+                    let costs = route.estimated_material_copper.map_or_else(String::new, |copper| format!(" Estimated replacement materials cost {copper} copper."));
+                    let _ = writeln!(situation,
+                        "Trade route by {}, item {} to buyer {}. {} sold, {} failed, last gross quote {} copper.{costs}",
+                        if route.sea { "sea" } else { "land" }, route.item, route.buyer, route.sales, route.failed_runs, route.quoted_copper);
+                }
+            });
+        }
         let system = director::system_prompt(&facts);
         let steps = ctx.cfg.llm.plan_steps();
         self.director(&mut *ctx.rng, interval).ask(AskRequest {
@@ -925,6 +1379,7 @@ impl Brain {
             characters_near: characters,
             players_near: players,
             plan: plan.iter().map(|s| s.label(&zone_name)).collect(),
+            guild_work: self.guild_work_context(ctx),
         };
         ctx.log.with_slot(|g| g.agent = view);
     }

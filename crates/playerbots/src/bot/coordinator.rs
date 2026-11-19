@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::cmd::{BotCmd, PairKind, PairOrder, PairRole};
 use super::guild::forming::Wishes as GuildWishes;
 use super::guild::plan::GuildWish;
-use super::party::{self, PartyOrder, PartyPurpose, Site, Wish};
+use super::party::{self, FieldActivity, PartyOrder, PartyPurpose, Site, Wish};
 use super::pvp::squad::{self, Standby};
 use crate::hub::Hub;
 
@@ -56,6 +56,10 @@ pub trait Dispatch: Send + Sync {
     /// What the bots share about guilds (the founding teams reserve their places there).
     fn guild_book(&self) -> Option<&super::guild::GuildBook> {
         None
+    }
+    /// Character identity and past interactions for dungeon matchmaking.
+    fn party_memory(&self, _bot: u32) -> (u32, crate::journal::Relationships) {
+        (0, Default::default())
     }
 }
 
@@ -82,6 +86,17 @@ impl Dispatch for Hub {
 
     fn guild_book(&self) -> Option<&super::guild::GuildBook> {
         Some(&self.guilds)
+    }
+
+    fn party_memory(&self, bot: u32) -> (u32, crate::journal::Relationships) {
+        let Some(slot) = self.slot(bot) else {
+            return (0, Default::default());
+        };
+        let character = slot.char_id.load(std::sync::atomic::Ordering::Relaxed);
+        (
+            character,
+            self.journal.read(bot, |j| j.relationships.clone()),
+        )
     }
 }
 
@@ -138,10 +153,26 @@ pub enum CoordMsg {
     },
     /// A bot wants to run a dungeon with a party.
     Party(Wish),
+    Field(FieldOffer),
     /// A bot wants to sign a charter with others and found a guild.
     Guild(GuildWish),
     /// A bot waits at an ambush post and offers itself to a squad (see [`squad`]).
     Ambush(Standby),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldOffer {
+    pub bot: u32,
+    pub at: [f32; 2],
+    pub mother: u32,
+    pub level: u8,
+    pub role: u8,
+    pub lead: f32,
+    pub explore: f32,
+    pub quest: f32,
+    pub forage: f32,
+    pub cooperation: f32,
+    pub outlaw: f32,
 }
 
 /// The cheap, cloneable end bots talk to the coordinator with.
@@ -161,6 +192,10 @@ impl CoordHandle {
     /// Asks for a party for an instance dungeon. False when the coordinator's inbox is full.
     pub fn request_party(&self, wish: Wish) -> bool {
         self.tx.try_send(CoordMsg::Party(wish)).is_ok()
+    }
+
+    pub fn request_field_party(&self, offer: FieldOffer) -> bool {
+        self.tx.try_send(CoordMsg::Field(offer)).is_ok()
     }
 
     /// Asks for a founding team for a guild. False when the coordinator's inbox is full.
@@ -233,6 +268,7 @@ pub struct Coordinator {
     recent: Vec<Recent>,
     sites: Vec<Site>,
     wishing: Vec<Wishing>,
+    field: Vec<(FieldOffer, Instant)>,
     standing: Vec<Standing>,
     formed: Vec<Formed>,
     next_party: u32,
@@ -254,6 +290,7 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
             recent: Vec::new(),
             sites: Vec::new(),
             wishing: Vec::new(),
+            field: Vec::new(),
             standing: Vec::new(),
             formed: Vec::new(),
             next_party: 1,
@@ -320,6 +357,7 @@ impl Coordinator {
             CoordMsg::Cancel { bot } => {
                 self.waiting.retain(|w| w.bot != bot);
                 self.wishing.retain(|w| w.wish.bot != bot);
+                self.field.retain(|(offer, _)| offer.bot != bot);
                 if let Some(g) = self.guilds.as_mut() {
                     g.cancel(bot);
                 }
@@ -347,6 +385,13 @@ impl Coordinator {
                 self.wishing.push(Wishing { wish, since: now });
                 self.form_parties(now);
             }
+            CoordMsg::Field(offer) => {
+                if let Some((prior, _)) = self.field.iter_mut().find(|(o, _)| o.bot == offer.bot) {
+                    *prior = offer;
+                } else {
+                    self.field.push((offer, now));
+                }
+            }
             CoordMsg::Request { kind, bot, at } => {
                 self.waiting.retain(|w| w.bot != bot);
                 self.waiting.push(Waiting {
@@ -369,6 +414,8 @@ impl Coordinator {
             .retain(|r| now.saturating_duration_since(r.at) < REPAIR_COOLDOWN);
         self.wishing
             .retain(|w| now.saturating_duration_since(w.since) < WISH_TTL);
+        self.field
+            .retain(|(_, at)| now.saturating_duration_since(*at) < Duration::from_secs(35));
         self.formed
             .retain(|f| now.saturating_duration_since(f.at) < FORMED_TTL);
         if let Some(g) = self.guilds.as_mut() {
@@ -378,8 +425,112 @@ impl Coordinator {
             .retain(|s| now.saturating_duration_since(s.since) < squad::STANDBY_TTL);
         self.pair_up(now);
         self.form_parties(now);
+        self.form_field_parties(now);
         self.form_guilds(now);
         self.form_squads();
+    }
+
+    fn form_field_parties(&mut self, now: Instant) {
+        const PARTNER_M: f32 = 120.0;
+        let distance = |a: FieldOffer, b: FieldOffer| (a.at[0] - b.at[0]).hypot(a.at[1] - b.at[1]);
+        let memory: Vec<_> = self
+            .field
+            .iter()
+            .map(|(o, _)| self.sink.party_memory(o.bot))
+            .collect();
+        let trust = |i: usize, j: usize| {
+            let a = memory[i].1.get(memory[j].0).map_or(0, |r| r.trust);
+            let b = memory[j].1.get(memory[i].0).map_or(0, |r| r.trust);
+            if a.min(b) <= -40 {
+                a.min(b)
+            } else {
+                a.max(b)
+            }
+        };
+        let mut used = rustc_hash::FxHashSet::default();
+        for (i, &(seed, at)) in self.field.iter().enumerate() {
+            if used.contains(&seed.bot)
+                || seed.mother == 0
+                || now.saturating_duration_since(at) < Duration::from_secs(7)
+            {
+                continue;
+            }
+            let mut group: SmallVec<[usize; 4]> = smallvec::smallvec![i];
+            while group.len() < 4 {
+                let next = self
+                    .field
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, (o, _))| {
+                        o.mother == seed.mother
+                            && !used.contains(&o.bot)
+                            && !group.contains(j)
+                            && group.iter().all(|&m| {
+                                let other = self.field[m].0;
+                                o.level.abs_diff(other.level) <= 5
+                                    && distance(*o, other) <= PARTNER_M
+                                    && trust(m, *j) > -40
+                            })
+                    })
+                    .min_by(|(a, (left, _)), (b, (right, _))| {
+                        let score = |index, offer: FieldOffer| {
+                            let duplicate =
+                                group.iter().any(|&m| self.field[m].0.role == offer.role);
+                            distance(seed, offer) - 2.0 * f32::from(trust(i, index))
+                                + 40.0 * (seed.outlaw - offer.outlaw).abs()
+                                - 15.0 * offer.cooperation
+                                + if duplicate { 20.0 } else { 0.0 }
+                        };
+                        score(*a, *left).total_cmp(&score(*b, *right))
+                    })
+                    .map(|(j, _)| j);
+                let Some(next) = next else { break };
+                group.push(next);
+            }
+            if group.len() < 2 {
+                continue;
+            }
+            group.sort_by(|&a, &b| self.field[b].0.lead.total_cmp(&self.field[a].0.lead));
+            let leader = self.field[group[0]].0;
+            let vote = |interest: fn(FieldOffer) -> f32| {
+                (interest(leader)
+                    + group
+                        .iter()
+                        .map(|&m| interest(self.field[m].0))
+                        .sum::<f32>())
+                    / (group.len() + 1) as f32
+            };
+            let explore = vote(|offer| offer.explore);
+            let quest = vote(|offer| offer.quest);
+            let forage = vote(|offer| offer.forage);
+            let outing =
+                if leader.forage > 0.0 && forage >= 0.45 && forage >= explore && forage >= quest {
+                    FieldActivity::Forage
+                } else if leader.quest > 0.0 && quest >= 0.6 && quest > explore {
+                    FieldActivity::Quest
+                } else if explore >= 0.5 {
+                    FieldActivity::Explore
+                } else {
+                    FieldActivity::Grind
+                };
+            let members = group
+                .iter()
+                .map(|&m| self.field[m].0.bot)
+                .collect::<SmallVec<[u32; party::MAX_PARTY]>>();
+            let order = PartyOrder {
+                party_id: self.next_party,
+                leader: leader.bot,
+                members,
+                roles: Default::default(),
+                purpose: PartyPurpose::Field(outing),
+            };
+            self.next_party = self.next_party.wrapping_add(1).max(1);
+            for &bot in &order.members {
+                used.insert(bot);
+                let _ = self.sink.send(bot, BotCmd::Party(Box::new(order.clone())));
+            }
+        }
+        self.field.retain(|(offer, _)| !used.contains(&offer.bot));
     }
 
     /// Forms founding teams out of the wishes until no more can be formed and orders every
@@ -459,7 +610,21 @@ impl Coordinator {
                 .iter()
                 .map(|w| (w.wish, now.saturating_duration_since(w.since).as_secs()))
                 .collect();
-            let Some(f) = party::plan(&wishes, &self.sites, self.relax_after_secs) else {
+            let memory: Vec<_> = wishes
+                .iter()
+                .map(|(w, _)| self.sink.party_memory(w.bot))
+                .collect();
+            let trust = |a: usize, b: usize| {
+                let a_trust = memory[a].1.get(memory[b].0).map_or(0, |r| r.trust);
+                let b_trust = memory[b].1.get(memory[a].0).map_or(0, |r| r.trust);
+                if a_trust.min(b_trust) <= -40 {
+                    a_trust.min(b_trust)
+                } else {
+                    a_trust.max(b_trust)
+                }
+            };
+            let Some(f) = party::plan_with(&wishes, &self.sites, self.relax_after_secs, trust)
+            else {
                 return;
             };
             let bots: SmallVec<[u32; party::MAX_PARTY]> =
@@ -680,6 +845,115 @@ mod tests {
             (*bot, second.role, second.partner_bot),
             (2, PairRole::Responder, 1)
         );
+    }
+
+    #[test]
+    fn field_party_uses_level_alliance_distance_and_leader_preference() {
+        let (rec, _, mut coord) = coordinator();
+        let now = Instant::now();
+        let offer = FieldOffer {
+            bot: 1,
+            at: [0.0, 0.0],
+            mother: 148,
+            level: 10,
+            role: 1,
+            lead: 0.2,
+            explore: 0.0,
+            quest: 0.0,
+            cooperation: 0.5,
+            forage: 0.0,
+            outlaw: 0.5,
+        };
+        for candidate in [
+            offer,
+            FieldOffer {
+                bot: 2,
+                at: [10.0, 0.0],
+                role: 2,
+                lead: 0.9,
+                explore: 0.9,
+                ..offer
+            },
+            FieldOffer {
+                bot: 3,
+                mother: 149,
+                ..offer
+            },
+            FieldOffer {
+                bot: 4,
+                level: 20,
+                ..offer
+            },
+            FieldOffer {
+                bot: 5,
+                at: [200.0, 0.0],
+                ..offer
+            },
+        ] {
+            coord.handle(CoordMsg::Field(candidate), now);
+        }
+        coord.expire(now + Duration::from_secs(8));
+        let orders = parties(&rec);
+        assert_eq!(orders.len(), 2);
+        for (_, order) in orders {
+            assert_eq!(order.members.as_slice(), &[2, 1]);
+            assert_eq!(order.leader, 2);
+            assert_eq!(order.purpose, PartyPurpose::Field(FieldActivity::Explore));
+        }
+    }
+
+    #[test]
+    fn a_field_leader_breaks_ties_for_questing_and_foraging() {
+        let (rec, _, mut coord) = coordinator();
+        let now = Instant::now();
+        let follower = FieldOffer {
+            bot: 1,
+            at: [0.0, 0.0],
+            mother: 148,
+            level: 10,
+            role: 1,
+            lead: 0.3,
+            explore: 0.9,
+            quest: 0.2,
+            cooperation: 0.5,
+            forage: 0.0,
+            outlaw: 0.5,
+        };
+        let leader = FieldOffer {
+            bot: 2,
+            role: 2,
+            lead: 0.9,
+            explore: 0.2,
+            quest: 0.9,
+            ..follower
+        };
+        coord.handle(CoordMsg::Field(follower), now);
+        coord.handle(CoordMsg::Field(leader), now);
+        coord.expire(now + Duration::from_secs(8));
+        let orders = parties(&rec);
+        assert_eq!(orders.len(), 2);
+        assert!(orders
+            .iter()
+            .all(|(_, order)| order.purpose == PartyPurpose::Field(FieldActivity::Quest)));
+
+        let (rec, _, mut coord) = coordinator();
+        let follower = FieldOffer {
+            explore: 0.4,
+            ..follower
+        };
+        let leader = FieldOffer {
+            forage: 0.95,
+            quest: 0.3,
+            ..leader
+        };
+        coord.handle(CoordMsg::Field(follower), now);
+        coord.handle(CoordMsg::Field(leader), now);
+        coord.expire(now + Duration::from_secs(8));
+        let orders = parties(&rec);
+        assert_eq!(orders.len(), 2);
+        assert!(orders
+            .iter()
+            .all(|(_, order)| order.purpose == PartyPurpose::Field(FieldActivity::Forage)));
     }
 
     #[test]

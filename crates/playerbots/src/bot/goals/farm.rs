@@ -49,6 +49,7 @@
 //! wish nudge apply on top (`brain::scores_now`).
 
 pub mod machine;
+mod stock;
 
 #[cfg(test)]
 mod tests;
@@ -64,11 +65,12 @@ use crate::bot::cmd::GoalArgs;
 use crate::bot::ctx::Ctx;
 use crate::bot::farm::plan::{self, Env, Plan, Vendor};
 use crate::bot::farm::site::{self, Site, WildEnv};
-use crate::bot::farm::{FarmMem, Foreign, Plot, MAX_PLOTS, STOLEN_LAND, WILD_LAND};
+use crate::bot::farm::{FarmMem, Foreign, Plot, MAX_PLOTS, OWN_LAND, STOLEN_LAND, WILD_LAND};
 use crate::bot::goals::housing::garden_radius;
+use crate::bot::guild::{leases, treasury};
 use crate::bot::motion::Pace;
 use crate::bot::state::{dist2d, BotState, UnitKind};
-use crate::config::BehaviorCfg;
+use crate::config::{BehaviorCfg, FarmLease};
 use crate::contest::plot_key;
 use crate::hub::{unix_ms, Hub, Logger};
 use crate::journal::WildPlot;
@@ -96,6 +98,8 @@ const NEED_CAP: f32 = 3.0;
 #[derive(Debug, Default)]
 pub struct Farm {
     run: Option<Box<Machine>>,
+    stock: Option<Box<stock::Job>>,
+    lease: Option<(u32, FarmLease)>,
     /// What the goal was started with (`wild`: plant on a wild patch, `item`: the seed to grow).
     args: Option<Box<GoalArgs>>,
 }
@@ -109,7 +113,10 @@ impl Farm {
     /// A fresh goal started with `args` (`GoalArgs::wild`: plant on unprotected land, `item`: the
     /// seed to grow, or a crop that gives that item).
     pub fn with_args(args: Option<Box<GoalArgs>>) -> Farm {
-        Farm { run: None, args }
+        Farm {
+            args,
+            ..Self::default()
+        }
     }
 
     /// The arguments it was started with.
@@ -121,7 +128,16 @@ impl Farm {
     /// decides between harvesting and planting.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
         restore_wild(ctx);
+        if let Some(job) = stock::choose(ctx) {
+            self.stock = Some(Box::new(job));
+            return;
+        }
         self.run = choose_job(ctx, self.args.as_deref()).map(Box::new);
+        self.lease = self
+            .run
+            .as_ref()
+            .and_then(|run| run.plan())
+            .and_then(|plan| lease_terms(ctx.state, &ctx.cfg.guild, plan.site));
         match &self.run {
             Some(m) => ctx.log.say(format!(
                 "goal: farm ({})",
@@ -133,12 +149,17 @@ impl Farm {
 
     /// One tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
-        let Some(machine) = self.run.as_mut() else {
-            return GoalStatus::Failed(FailReason::NoTarget);
-        };
         if !ctx.cfg.farm.enabled {
             return GoalStatus::Failed(FailReason::Other("farming is switched off"));
         }
+        if let Some(job) = self.stock.as_mut() {
+            return job.tick(ctx);
+        }
+        let Some(machine) = self.run.as_mut() else {
+            return GoalStatus::Failed(FailReason::NoTarget);
+        };
+        let planted_before = machine.planted;
+        let husbandry = stock::enabled(ctx);
         let mut mem = ctx.state.market.take_farm();
         let harvested_before = mem.harvested;
         let mut acts = Vec::new();
@@ -151,6 +172,7 @@ impl Farm {
                 now_ms: ctx.now_ms,
                 fallback_z: ctx.state.me.pos[2],
                 rng: RefCell::new(&mut *ctx.rng),
+                husbandry,
             };
             let st: &BotState = ctx.state;
             let count = |t: u32| st.item_count(t);
@@ -183,6 +205,25 @@ impl Farm {
             sync_wild(ctx, &mut mem, patch.map(|s| s.centre));
         }
         ctx.state.market.put_farm(mem);
+        if let Some((guild, lease)) = self.lease {
+            let planted = machine.planted.saturating_sub(planted_before);
+            let owed = u64::from(planted) * u64::from(lease.rent_copper);
+            if owed != 0 {
+                ctx.hub
+                    .journal
+                    .update(ctx.persona.id, |j| treasury::queue_copper(j, guild, owed));
+                ctx.log.say(format!(
+                    "farm: {owed} copper due for planting on leased garden {}",
+                    lease.house
+                ));
+            }
+            if acts.iter().any(|act| matches!(act, Act::Plant { .. }))
+                && !leases::available(ctx.state, &ctx.cfg.guild)
+                    .any(|(id, _, terms)| id == guild && terms.house == lease.house)
+            {
+                return GoalStatus::Failed(FailReason::Other("guild planting permission changed"));
+            }
+        }
         apply(ctx, acts);
         if let Some(doodad) = last_crop {
             log_produce(ctx, doodad);
@@ -193,6 +234,10 @@ impl Farm {
     /// Called when the goal ends, fails or is interrupted: the harvest window closes, the walk
     /// stops, the board is told what grows.
     pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(stock) = self.stock.take() {
+            stock.stop(ctx);
+            return;
+        }
         let mut mem = ctx.state.market.take_farm();
         if let Some(mut machine) = self.run.take() {
             let mut acts = Vec::new();
@@ -228,6 +273,9 @@ impl Farm {
     /// Appends a one-line description of what the goal is doing to `out`.
     pub fn describe(&self, out: &mut String) {
         out.push_str("farm");
+        if let Some(job) = &self.stock {
+            out.push_str(job.description());
+        }
         if let Some(m) = &self.run {
             out.push_str(": ");
             out.push_str(m.note());
@@ -266,11 +314,9 @@ pub fn score(ctx: &Ctx<'_>, _base: f32) -> f32 {
     let mem = ctx.state.market.farm();
     let now = ctx.now_ms;
     let pos = ctx.state.me.pos;
-    if mem.is_some_and(|m| {
-        m.plots
-            .iter()
-            .any(|p| p.due(now) && dist2d(pos, p.pos) <= cfg.max_trip_m)
-    }) {
+    if stock::choose(ctx).is_some()
+        || mem.is_some_and(|m| m.plots.iter().any(|p| harvest_due(ctx, p, now, pos)))
+    {
         return base * HARVEST_BOOST;
     }
     // a ripe wild plot of the journal the memory has not found again yet (after a restart)
@@ -307,6 +353,9 @@ struct Who {
     wild_only: bool,
     /// The seed (or produce) the goal was started for.
     item: Option<u32>,
+    /// This planting uses the portion of farm space assigned to the guild.
+    guild_order: bool,
+    livestock_order: Option<u32>,
     /// The bot keeps out of zones at war.
     avoid_war: bool,
 }
@@ -316,14 +365,23 @@ impl Who {
         let cfg = &ctx.cfg.farm;
         let asked = args.is_some_and(|a| a.wild);
         let outlaw = ctx.persona.profile.outlaw >= cfg.wild_outlaw;
+        let order = crate::bot::guild::profession::farm_order(ctx);
         Who {
             bot: ctx.persona.id,
-            wild: cfg.wild && (asked || outlaw),
-            wild_only: cfg.wild && asked,
-            item: args.and_then(|a| a.item),
+            wild: order.is_none() && cfg.wild && (asked || outlaw),
+            wild_only: order.is_none() && cfg.wild && asked,
+            item: order.or_else(|| args.and_then(|a| a.item)),
+            guild_order: order.is_some(),
+            livestock_order: order.filter(|_| stock::enabled(ctx)),
             avoid_war: crate::bot::war::avoiding(&ctx.cfg.events),
         }
     }
+}
+
+fn harvest_due(ctx: &Ctx<'_>, plot: &Plot, now: u64, pos: [f32; 3]) -> bool {
+    plot.due(now)
+        && dist2d(pos, plot.pos) <= ctx.cfg.farm.max_trip_m
+        && !(stock::enabled(ctx) && ctx.world.farm().livestock_yields(plot.doodad).is_some())
 }
 
 /// Harvest if a plot is due and reachable, else plant if there is a plan.
@@ -333,11 +391,7 @@ fn choose_job(ctx: &mut Ctx<'_>, args: Option<&GoalArgs>) -> Option<Machine> {
     let pos = ctx.state.me.pos;
     let mem = ctx.state.market.farm();
     let fetch = cfg.public_farms && mem.is_none_or(|m| !m.list_asked);
-    if mem.is_some_and(|m| {
-        m.plots
-            .iter()
-            .any(|p| p.due(now) && dist2d(pos, p.pos) <= cfg.max_trip_m)
-    }) {
+    if mem.is_some_and(|m| m.plots.iter().any(|p| harvest_due(ctx, p, now, pos))) {
         return Some(Machine::harvest(fetch, now));
     }
     if let Some(f) = steal_target(ctx) {
@@ -399,7 +453,7 @@ fn plan_now(
     let mut sites = if who.wild_only {
         Vec::new()
     } else {
-        candidate_sites(world, state, mem, cfg)
+        candidate_sites(world, state, mem, cfg, who.livestock_order.is_some())
     };
     // an outlaw plants out in the wild first, the rest where it may
     if let Some(w) = wild {
@@ -408,6 +462,24 @@ fn plan_now(
     if sites.is_empty() {
         return None;
     }
+    let mut wished = hub.pop.wished();
+    if let Some(item) = who.item.filter(|_| who.guild_order) {
+        let farm = world.farm();
+        if let Some(crop) = farm.crop_of_seed(item) {
+            let yields = who
+                .livestock_order
+                .and_then(|_| farm.livestock_yields(crop.doodad))
+                .unwrap_or(&crop.produce);
+            wished.extend(
+                yields
+                    .iter()
+                    .map(|y| y.item)
+                    .filter(|&product| product != item),
+            );
+        } else {
+            wished.push(item);
+        }
+    }
     let env = RealEnv {
         world,
         state,
@@ -415,17 +487,25 @@ fn plan_now(
         bot,
         gm: cfg.bots.gm_bootstrap,
         max_trip_m: fcfg.max_trip_m,
-        wished: hub.pop.wished(),
+        wished,
         sites: &sites,
         mem,
         now_ms,
+        livestock_order: who.livestock_order,
     };
     let crops = world.farm().crops();
     let pick = match who.item {
         // the goal was started for an item: that seed, or a crop that gives it
         Some(item) => crops
             .iter()
-            .filter(|c| c.seed == item || c.produce.iter().any(|y| y.item == item))
+            .filter(|c| {
+                c.seed == item
+                    || env
+                        .livestock_yields(c)
+                        .unwrap_or(&c.produce)
+                        .iter()
+                        .any(|y| y.item == item)
+            })
             .filter_map(|c| plan::evaluate(c, &env, fcfg.growth_rate))
             .max_by(|a, b| a.score.total_cmp(&b.score))?,
         None => plan::choose(crops, &env, fcfg.growth_rate, rng)?,
@@ -433,11 +513,39 @@ fn plan_now(
     let crop = world.farm().crop_of_seed(pick.seed)?;
     let gm = cfg.bots.gm_bootstrap;
     let plan = sites.iter().filter(|s| takes(crop, s)).find_map(|&site| {
-        let room = if site.is_wild() {
+        let mut room = if site.is_wild() {
             site::wild_room(mem, fcfg.max_plots, fcfg.wild_plots)
         } else {
-            site::room(mem, site.land, fcfg.max_plots)
+            let limit = if who.guild_order {
+                fcfg.max_plots.div_ceil(2)
+            } else {
+                fcfg.max_plots
+            };
+            site::room(mem, site.land, limit)
         };
+        if let Some((guild, lease)) =
+            lease_terms(state, &cfg.guild, site).filter(|(_, lease)| lease.rent_copper != 0)
+        {
+            let terms = cfg.guild.treasuries.get(&guild.to_string())?;
+            let week = unix_ms() / treasury::WEEK_MS;
+            let (debt, paid) = hub.journal.read(who.bot, |j| {
+                j.guild_treasury
+                    .get(&guild)
+                    .map_or((0, false), |a| (a.unpaid_commission, a.paid_week == week))
+            });
+            let dues = if paid {
+                0
+            } else {
+                u64::from(terms.weekly_dues_copper)
+            };
+            let available = (state.me.money.max(0) as u64)
+                .saturating_sub(debt)
+                .saturating_sub(dues + treasury::EXPRESS_FEE as u64)
+                .saturating_sub(u64::from(terms.reserve_copper));
+            let seed_cost = if pick.have > 0 { 0 } else { pick.price };
+            let cost = u64::from(lease.rent_copper) + u64::from(seed_cost);
+            room = room.min(u32::try_from(available / cost).unwrap_or(u32::MAX));
+        }
         let plan = plan::make_plan(&pick, site, room, state.me.money, gm)?;
         if site.is_wild() {
             plan::labor_cap(plan, state.me.labor, seed_labor(world, pick.seed), gm)
@@ -491,6 +599,9 @@ fn wild_site(
 /// Whether `site` takes `crop`: a garden and a wild patch take any crop that grows on land, a
 /// farm the crops of its kind.
 fn takes(crop: &Crop, site: &Site) -> bool {
+    if crop.group == 5 && site.is_wild() {
+        return false;
+    }
     match site.kind() {
         None => true,
         Some(kind) => crop.allowed_in(kind),
@@ -504,6 +615,7 @@ fn candidate_sites(
     state: &BotState,
     mem: Option<&FarmMem>,
     cfg: &crate::config::Config,
+    include_ranch: bool,
 ) -> Vec<Site> {
     let fcfg = &cfg.farm;
     let mut all: Vec<Site> = Vec::new();
@@ -511,15 +623,34 @@ fn candidate_sites(
         all.extend(site::gardens(&state.houses, |template| {
             world.housing_design(template).map_or(4.0, garden_radius)
         }));
+        for (_, house, _) in leases::available(state, &cfg.guild) {
+            all.extend(site::gardens(&[house], |template| {
+                world.housing_design(template).map_or(4.0, garden_radius)
+            }));
+        }
     }
     if fcfg.public_farms {
-        all.extend(site::farms(
-            world.farm().areas(),
-            FarmKind::Farm.bit() | FarmKind::Nursery.bit(),
-        ));
+        let mut kinds = FarmKind::Farm.bit() | FarmKind::Nursery.bit();
+        if include_ranch {
+            kinds |= FarmKind::Ranch.bit();
+        }
+        all.extend(site::farms(world.farm().areas(), kinds));
     }
     all.retain(|s| site::room(mem, s.land, fcfg.max_plots) > 0);
     site::nearest(all, state.me.pos, fcfg.max_trip_m)
+}
+
+fn lease_terms(
+    state: &BotState,
+    cfg: &crate::config::GuildCfg,
+    site: Site,
+) -> Option<(u32, FarmLease)> {
+    if site.land != OWN_LAND {
+        return None;
+    }
+    leases::available(state, cfg)
+        .find(|(_, _, lease)| lease.house == site.index)
+        .map(|(guild, _, lease)| (guild, lease))
 }
 
 /// The ripe crop of somebody else in view an outlaw may take (`[farm] steal`, see the module
@@ -527,7 +658,14 @@ fn candidate_sites(
 /// without `bots.gm_bootstrap`, of anybody), not watched by a real player. The nearest.
 pub fn steal_target(ctx: &Ctx<'_>) -> Option<Foreign> {
     let cfg = &ctx.cfg.farm;
-    if !cfg.steal || ctx.persona.profile.outlaw < cfg.wild_outlaw || ctx.real_player_near {
+    use crate::bot::guild::profession::{membership, Profession};
+    let thief = matches!(membership(ctx), Some((_, Profession::Thief, false)));
+    if !cfg.steal
+        || !thief && ctx.persona.profile.outlaw < cfg.wild_outlaw
+        || thief && ctx.state.team().is_some_and(|team| team.in_team())
+        || ctx.real_player_near
+        || crate::bot::guild::profession::farm_order(ctx).is_some()
+    {
         return None;
     }
     let players = cfg.steal_from_players && !ctx.cfg.bots.gm_bootstrap;
@@ -835,9 +973,16 @@ struct RealEnv<'a> {
     sites: &'a [Site],
     mem: Option<&'a FarmMem>,
     now_ms: u64,
+    livestock_order: Option<u32>,
 }
 
 impl Env for RealEnv<'_> {
+    fn livestock_yields(&self, crop: &Crop) -> Option<&[aa_world::Yield]> {
+        let order = self.livestock_order?;
+        let yields = self.world.farm().livestock_yields(crop.doodad)?;
+        (crop.seed == order || yields.iter().any(|y| y.item == order)).then_some(yields)
+    }
+
     fn have(&self, seed: u32) -> i64 {
         self.state.item_count(seed)
     }
@@ -914,9 +1059,14 @@ struct RealOps<'a> {
     now_ms: u64,
     fallback_z: f32,
     rng: RefCell<&'a mut fastrand::Rng>,
+    husbandry: bool,
 }
 
 impl Ops for RealOps<'_> {
+    fn managed_stock(&self, doodad: u32) -> bool {
+        self.husbandry && self.world.farm().livestock_yields(doodad).is_some()
+    }
+
     fn spot(&self, mem: &FarmMem, site: &Site, radius_mm: u16) -> Option<[f32; 3]> {
         let spacing = site::spacing_m(radius_mm);
         let (world, hub, bot, now) = (self.world, self.hub, self.bot, self.now_ms);

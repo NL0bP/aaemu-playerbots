@@ -101,7 +101,7 @@ const MINT_WAIT_MS: u64 = 7_000;
 /// How often the initiator re-aims at a partner that is not at the meeting point.
 const CHASE_MS: u64 = 3_000;
 /// A request older than the server's invitation (60 s) is dropped.
-const INVITE_TTL_MS: u64 = 60_000;
+pub(super) const INVITE_TTL_MS: u64 = 60_000;
 
 /// Item templates that turned out to be bound: the server cancelled a trade right after a put-up
 /// with `TRADE_SOUL_BOUND_ITEM`. Shared by all bots (the bind type belongs to the template).
@@ -587,7 +587,7 @@ impl Trade {
 
     fn prepare(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
-        let needs = QuestNeeds::of(ctx.world, &ctx.state.quests);
+        let needs = QuestNeeds::for_bot(ctx);
         let world = ctx.world;
         match choose_offer(
             &ctx.state.bag,
@@ -745,7 +745,7 @@ impl Trade {
         let allow_other = !ctx.gm_allowed();
         let (identity, partner_is_bot) = self.who_is_in_the_window(ctx);
         let world = ctx.world;
-        let needs = QuestNeeds::of(world, &ctx.state.quests);
+        let needs = QuestNeeds::for_bot(ctx);
         let keep = |template: u32| keep_of(world, &needs, template);
         let worth = |template: u32| {
             world

@@ -14,15 +14,16 @@ use super::meet::{self, Side};
 use super::report;
 use crate::bot::cmd::GoalKind;
 use crate::bot::ctx::Ctx;
-use crate::bot::goals::trade;
+use crate::bot::goals::{trade, work};
+use crate::bot::guild::supply;
 use crate::bot::market::ads::board::{self, Peer, PEER_FRESH_MS};
 use crate::bot::market::ads::lines::{self, Meet, Words};
 use crate::bot::market::ads::names;
 use crate::bot::market::ads::price::{PriceSource, VendorPrices};
 use crate::bot::market::ads::talk::{Medium, PlaceQ};
-use crate::bot::market::ads::{Env, Need, Rules, Surplus};
-use crate::bot::market::ledger::Ledger;
-use crate::bot::market::needs::QuestNeeds;
+use crate::bot::market::ads::{Env, Funding, Need, Rules, Surplus};
+use crate::bot::market::ledger::{bag_count, Ledger};
+use crate::bot::market::needs::{guild_recipe, QuestNeeds};
 use crate::bot::state::{Item, StateError, UnitKind};
 use crate::hub::unix_ms;
 
@@ -80,8 +81,7 @@ pub fn surplus_of(
 }
 
 /// What a bot would buy: the shared trade goods it holds hardly any of (the order, and so the one
-/// it advertises first, changes every hour). A stand-in for the materials of the bot's own work,
-/// which no goal reports yet. Only goods that are `tradable` (see
+/// it advertises first, changes every hour). Only goods that are `tradable` (see
 /// [`aa_world::ItemFacts::tradable`]) are wanted: nobody sells the others.
 pub fn wanted_goods(
     bag: &rustc_hash::FxHashMap<u16, Item>,
@@ -110,6 +110,8 @@ pub fn wanted_goods(
             out.push(Need {
                 template,
                 qty: NEED_QTY,
+                order_price: None,
+                funding: None,
             });
         }
     }
@@ -174,7 +176,6 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     let board = board::global();
     let real_near = ctx.real_player_near;
     let bot_id = persona.id;
-
     let st = &mut *ctx.state;
     let pos = st.me.pos;
     let group = if st.place.in_instance() {
@@ -203,20 +204,142 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     }
 
     // what the bot has and wants
-    let quest_needs = QuestNeeds::of(world, &st.quests);
-    let surplus = surplus_of(&inner.ledger, world, &st.bag, &quest_needs);
-    let needs = wanted_goods(&st.bag, money, bot_id, unix, |t| {
-        world.item_facts(t).is_some_and(ItemFacts::tradable)
-    });
-    let audience = board.audience(name, group, unix) + usize::from(real_near);
+    crate::bot::guild::treasury::note_pack_budget(ctx);
+    let work_order = work::selected_order(ctx);
+    let training = work::training::Allowance::for_order(ctx, work_order);
+    let guild_recipe = guild_recipe(ctx);
+    let customer_provides_inputs =
+        work::customer::active(ctx).is_some_and(|order| order.awaits_materials());
+    let recovery_orders = crate::bot::guild::recovery::shopping(ctx);
+    let recovery_stock = crate::bot::guild::recovery::stock(ctx);
+    let land_order = crate::bot::guild::land::shopping(ctx);
+    let lure_order = crate::bot::goals::fish::supplies::shopping(ctx);
+    let supply_contract = supply::shopping(ctx);
+    let item_needs = QuestNeeds::for_bot(ctx);
+    let st = &mut *ctx.state;
+    let inner = st.market.inner_mut();
+    let surplus = surplus_of(&inner.ledger, world, &st.bag, &item_needs);
+    let tradable = |t| world.item_facts(t).is_some_and(ItemFacts::tradable);
     let prices = VendorPrices(world);
+    let mut needs = wanted_goods(&st.bag, money, bot_id, unix, tradable);
+    if customer_provides_inputs {
+        if let Some(craft) = guild_recipe {
+            needs.retain(|need| {
+                !craft
+                    .materials
+                    .iter()
+                    .any(|&(item, _)| item == need.template)
+            });
+        }
+    } else if let Some(craft) = guild_recipe.filter(|c| st.me.level >= c.req_level) {
+        for &(template, quantity) in craft.materials.iter().rev().filter(|&&(t, _)| tradable(t)) {
+            let count = bag_count(&st.bag, template);
+            let missing = u32::try_from(i64::from(quantity) - count).unwrap_or(0);
+            if let Some((allowance, price)) = training
+                .as_ref()
+                .and_then(|allowance| allowance.price(template).map(|price| (allowance, price)))
+            {
+                needs.retain(|need| need.template != template);
+                let qty = u64::from(missing).min(allowance.copper / u64::from(price)) as u32;
+                if qty != 0 {
+                    needs.insert(
+                        0,
+                        Need {
+                            template,
+                            qty,
+                            order_price: Some(price),
+                            funding: Some(Funding::Training(allowance.guild)),
+                        },
+                    );
+                }
+            } else if money >= SHOP_MONEY && missing != 0 {
+                needs.retain(|need| need.template != template);
+                needs.insert(
+                    0,
+                    Need {
+                        template,
+                        qty: missing,
+                        order_price: prices
+                            .quote(template)
+                            .filter(|_| craft.is_pack)
+                            .map(|q| q.ask),
+                        funding: None,
+                    },
+                );
+            }
+        }
+    }
+    let requested = match work_order {
+        Some((work::Order::Gather { item, doodad }, _))
+            if world.gather_doodads(item).contains(&doodad) =>
+        {
+            Some((item, NEED_QTY))
+        }
+        Some((work::Order::Hunt { item, count }, _)) if !world.work_droppers(item).is_empty() => {
+            Some((item, u32::from(count)))
+        }
+        _ => None,
+    };
+    if let Some((item, target)) = requested.filter(|(item, _)| tradable(*item)) {
+        let count = bag_count(&st.bag, item);
+        if let Some(need) = material_request(
+            item,
+            target,
+            count,
+            &prices,
+            hub.market_prices.average(item, unix),
+        ) {
+            needs.retain(|n| n.template != item);
+            needs.insert(0, need);
+        }
+    }
+    needs.retain(|need| {
+        !recovery_stock
+            .iter()
+            .any(|&(item, _)| item == need.template)
+    });
+    for order in recovery_orders.into_iter().rev() {
+        needs.insert(0, order);
+    }
+    if let Some(order) = land_order {
+        needs.retain(|need| need.template != order.template);
+        needs.insert(0, order);
+    }
+    if let Some(order) = lure_order {
+        needs.retain(|need| need.template != order.template);
+        needs.insert(0, order);
+    }
+    if let Some(order) = supply_contract {
+        needs.retain(|need| need.template != order.template);
+        needs.insert(0, order);
+    }
+    let audience = board.audience(name, group, unix) + usize::from(real_near);
     let index = names::global(world);
     let units = &st.units;
     let item_name = |t: u32| world.item_name(t).unwrap_or("goods").to_owned();
     let is_bot = |n: &str| hub.chat.names.contains(n);
+    let permits_supplier = |funding, name: &str| {
+        supply::permits_supplier(&cfg.guild, &hub.guilds, funding, name, None)
+    };
+    let trusted_companion = |name: &str| {
+        let Some(character) = units.values().find(|unit| {
+            unit.kind == UnitKind::Character
+                && unit
+                    .name
+                    .as_deref()
+                    .is_some_and(|seen| seen.eq_ignore_ascii_case(name))
+        }) else {
+            return false;
+        };
+        hub.journal.read(bot_id, |j| {
+            j.relationships
+                .get(character.id)
+                .is_some_and(|r| r.trust >= 20)
+        })
+    };
     let interest = |template: u32, qty: u32, ask: u32| {
         let need = needs.iter().find(|n| n.template == template)?;
-        let q = prices.quote(template)?;
+        let q = need.quote(&prices)?;
         let afford = u32::try_from(money / i64::from(ask.max(1))).unwrap_or(u32::MAX);
         let want = need.qty.min(qty).min(afford);
         (want > 0).then_some((want, q.ceiling))
@@ -257,7 +380,9 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
                 if mirage {
                     mirage_ok.then_some(Meet::Mirage)
                 } else {
-                    board.meet_for(peer, name, unix)
+                    board
+                        .meet_for(peer, name, unix)
+                        .or_else(|| meet::local_town(me_side, peer_side(peer), town))
                 }
             }
         }
@@ -280,6 +405,8 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
         money,
         audience,
         is_bot: &is_bot,
+        permits_supplier: &permits_supplier,
+        trusted_companion: &trusted_companion,
         interest: &interest,
         place: &mut place,
         board,
@@ -304,6 +431,28 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     say_due(ctx, now, unix);
     watch_chat_errors(ctx, now);
     pending && ready_for_meeting(ctx, running)
+}
+
+fn material_request(
+    item: u32,
+    target: u32,
+    count: i64,
+    prices: &dyn PriceSource,
+    recent: Option<f32>,
+) -> Option<Need> {
+    let recent = recent?;
+    let normal = prices.quote(item)?;
+    if recent < normal.ask as f32 * 1.25 {
+        return None;
+    }
+    let qty = u32::try_from(i64::from(target).saturating_sub(count)).ok()?;
+    let price = (recent * 0.9).floor() as u32;
+    (qty > 0 && price > 0).then_some(Need {
+        template: item,
+        qty,
+        order_price: Some(price),
+        funding: None,
+    })
 }
 
 /// Whether the bot may leave what it does for a meeting now.

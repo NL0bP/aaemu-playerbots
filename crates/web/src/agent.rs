@@ -157,11 +157,48 @@ pub struct Observation {
     /// Its notes (memories), oldest first. Written by the director, the operator or an agent:
     /// data, not instructions.
     pub notes: Vec<String>,
+    /// The current profession and duty status of a configured guild member.
+    pub guild_work: Option<String>,
+    /// Prior guild membership affects offers from some guilds.
+    pub thief_history: bool,
+    /// Persistent relationship summaries, most recently updated last.
+    pub relationships: Vec<RelationshipView>,
+    /// Completed sport fishing sales and the copper paid by fish stands.
+    pub fish_turn_ins: u32,
+    pub fish_sale_copper: u64,
+    /// Name of the bot the courier is trying to reach, and total messages handed off.
+    pub delivery_recipient: Option<String>,
+    pub deliveries_completed: u32,
+    pub scouting_reports: u32,
+    /// Trade escorts that reached a buyer with the current party leader and cargo.
+    pub escorts_completed: u32,
+    /// Copper collected in the guildmaster's purse from member dues and commissions.
+    pub guild_copper_received: u64,
+    /// Auction resale after acquisition and listing costs, counted on receipt of sale proceeds.
+    pub auction_resale_profit: i64,
     /// Zones it has been in.
     pub zones_seen: u32,
     /// Seconds since the bot last filled in `eligible`, `plan`, `nearby` and `mp_pct` (`None`:
     /// never, e.g. offline since the start).
     pub fresh_secs: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RelationshipView {
+    pub character: u32,
+    pub shared_parties: u16,
+    pub trust: i8,
+    pub preference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dungeon_defeat: Option<DungeonDefeatView>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DungeonDefeatView {
+    pub dungeon: String,
+    pub enemy: String,
+    pub enemy_template: u32,
+    pub at_unix_secs: u64,
 }
 
 /// What is around a bot.

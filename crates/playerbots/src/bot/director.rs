@@ -87,27 +87,20 @@ const NOTES_SHOWN: usize = 3;
 /// Longest note shown, in characters.
 const NOTE_SHOWN_CHARS: usize = 120;
 
-/// Whether `kind` needs GM rights (`bots.gm_bootstrap`) to get anywhere: trade runs and housing
-/// need materials, labor, certificates and gold a fresh character does not have.
-pub fn gm_only(kind: GoalKind) -> bool {
-    matches!(kind, GoalKind::TradeRun | GoalKind::Housing)
-}
-
 /// The goals the director may offer: those the brain's scoring gives a chance (`scores` is 0 for
-/// switched-off, cooling-down and disabled goals), without the GM-only ones when GM rights are
-/// off.
-pub fn eligible_goals(scores: &[f32; GoalKind::COUNT], gm_allowed: bool) -> Goals {
-    eligible_scored(scores, gm_allowed)
+/// switched-off, cooling-down or unavailable goals).
+pub fn eligible_goals(scores: &[f32; GoalKind::COUNT]) -> Goals {
+    eligible_scored(scores)
         .into_iter()
         .map(|(g, _)| g)
         .collect()
 }
 
 /// [`eligible_goals`] with their scores, best first (ties in [`GoalKind::ALL`] order).
-pub fn eligible_scored(scores: &[f32; GoalKind::COUNT], gm_allowed: bool) -> Scored {
+pub fn eligible_scored(scores: &[f32; GoalKind::COUNT]) -> Scored {
     let mut out: Scored = GoalKind::ALL
         .into_iter()
-        .filter(|g| scores[g.index()] > 0.0 && (gm_allowed || !gm_only(*g)))
+        .filter(|g| scores[g.index()] > 0.0)
         .map(|g| (g, scores[g.index()]))
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -135,8 +128,17 @@ pub fn option_text(kind: GoalKind) -> &'static str {
         GoalKind::Farm => "farm: plant and harvest crops",
         GoalKind::Explore => "explore: see places this character has never been",
         GoalKind::Gear => "gear: get, equip and upgrade gear for this level",
+        GoalKind::Work => "work: craft or gather for the configured guild production order",
+        GoalKind::Fish => {
+            "fish: catch a sport fish at an active school and sell it at a fish stand"
+        }
+        GoalKind::Delivery => "delivery: carry a message or carry out an accepted scouting job",
+        GoalKind::FieldParty => {
+            "field_party: explore or grind with nearby bots of compatible level"
+        }
         GoalKind::Rest => "rest: sit down and recover",
         GoalKind::Wander => "wander: stroll around and see the sights",
+        GoalKind::Siege => "siege: register and fight for the guild's announced castle siege",
     }
 }
 
@@ -355,7 +357,10 @@ pub fn step_allowed(
 /// `farm.wild_outlaw` (the same threshold the farm goal uses).
 pub fn wild_ok(ctx: &Ctx<'_>) -> bool {
     let f = &ctx.cfg.farm;
-    f.enabled && f.wild && ctx.persona.profile.outlaw >= f.wild_outlaw
+    f.enabled
+        && f.wild
+        && ctx.persona.profile.outlaw >= f.wild_outlaw
+        && super::guild::profession::farm_order(ctx).is_none()
 }
 
 /// The options for this tick: the eligible goals (`scored`, best first) and the variants the bot
@@ -414,7 +419,18 @@ pub fn menu(ctx: &Ctx<'_>, scored: &[(GoalKind, f32)]) -> Menu {
         }
     }
     if has(GoalKind::Wander) {
-        if let Some(z) = here.and_then(|h| super::goals::quest::atlas(ctx.world).zone(h)) {
+        if let Some(at) = super::goals::wander::settlement_hangout(ctx)
+            .or_else(|| super::goals::wander::settlement_market(ctx))
+            .filter(|at| ctx.world.zone_key_at(at[0], at[1]).is_some())
+        {
+            variants.push(Opt {
+                kind: GoalKind::Wander,
+                what: What::Point {
+                    at,
+                    town: ctx.world.zone_key_at(at[0], at[1]),
+                },
+            });
+        } else if let Some(z) = here.and_then(|h| super::goals::quest::atlas(ctx.world).zone(h)) {
             let d = dist(me2, z.hub);
             if (TOWN_MIN_M..=TOWN_MAX_M).contains(&d) && !ctx.in_war_zone(z.hub[0], z.hub[1]) {
                 variants.push(Opt {
@@ -983,22 +999,19 @@ mod tests {
     }
 
     #[test]
-    fn gm_only_goals_are_offered_only_when_gm_rights_are_on() {
+    fn eligible_housing_and_trade_run_are_offered() {
         let s = scores_for(0);
-        let without = eligible_goals(&s, false);
-        assert!(!without.contains(&GoalKind::TradeRun));
-        assert!(!without.contains(&GoalKind::Housing));
-        assert!(without.contains(&GoalKind::Quest) && without.contains(&GoalKind::Wander));
-        let with = eligible_goals(&s, true);
-        assert!(with.contains(&GoalKind::TradeRun) && with.contains(&GoalKind::Housing));
+        let eligible = eligible_goals(&s);
+        assert!(eligible.contains(&GoalKind::TradeRun) && eligible.contains(&GoalKind::Housing));
+        assert!(eligible.contains(&GoalKind::Quest) && eligible.contains(&GoalKind::Wander));
         // (the dungeon and sail goals score themselves from the whole context, see
         // `brain::own_scores`: this raw table leaves the sail goal at 0 and has the dungeon's
         // temperament weight, which `own_scores` replaces)
         // (the auction, market, guild, gank, warzone, event, companion and farm goals do too, and
         // are 0 until their features exist)
-        assert_eq!(with.len(), GoalKind::COUNT - 11);
-        assert!(!with.contains(&GoalKind::Sail));
-        assert!(!with.contains(&GoalKind::Auction) && !with.contains(&GoalKind::Market));
+        assert_eq!(eligible.len(), GoalKind::COUNT - 16);
+        assert!(!eligible.contains(&GoalKind::Sail));
+        assert!(!eligible.contains(&GoalKind::Auction) && !eligible.contains(&GoalKind::Market));
         for g in [
             GoalKind::Guild,
             GoalKind::Gank,
@@ -1008,20 +1021,24 @@ mod tests {
             GoalKind::Farm,
             GoalKind::Explore,
             GoalKind::Gear,
+            GoalKind::Siege,
         ] {
-            assert!(!with.contains(&g), "{g:?}");
+            assert!(!eligible.contains(&g), "{g:?}");
         }
         // the scored list is best first
-        let scored = eligible_scored(&s, true);
+        let scored = eligible_scored(&s);
         assert!(scored.windows(2).all(|w| w[0].1 >= w[1].1));
     }
 
     #[test]
     fn disabled_cooling_down_and_switched_off_goals_are_never_offered() {
-        let blocked = (1 << GoalKind::Quest.index()) | (1 << GoalKind::Grind.index());
+        let blocked = (1 << GoalKind::Quest.index())
+            | (1 << GoalKind::Grind.index())
+            | (1 << GoalKind::Housing.index());
         let s = scores_for(blocked);
-        let list = eligible_goals(&s, true);
+        let list = eligible_goals(&s);
         assert!(!list.contains(&GoalKind::Quest) && !list.contains(&GoalKind::Grind));
+        assert!(!list.contains(&GoalKind::Housing));
         // a weight of 0 in the config switches a goal off for the scoring, and so for the director
         let base = base_weights(
             &BehaviorCfg {
@@ -1040,8 +1057,8 @@ mod tests {
                 blocked: 0,
             },
         );
-        assert!(!eligible_goals(&s, true).contains(&GoalKind::Duel));
-        assert!(eligible_goals(&[0.0; GoalKind::COUNT], true).is_empty());
+        assert!(!eligible_goals(&s).contains(&GoalKind::Duel));
+        assert!(eligible_goals(&[0.0; GoalKind::COUNT]).is_empty());
     }
 
     #[test]

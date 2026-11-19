@@ -13,7 +13,7 @@
 
 use aa_proto::cs;
 
-use crate::bot::combat::attackable;
+use crate::bot::combat::{attackable, normal_skills_blocked};
 use crate::bot::ctx::Ctx;
 use crate::bot::manner;
 use crate::bot::motion::Pace;
@@ -44,6 +44,7 @@ pub struct Rest {
     /// Walking away from monsters before settling down.
     moving_away: bool,
     safe_tries: u8,
+    tried_supply: bool,
     next_heal_ms: u64,
 }
 
@@ -62,6 +63,7 @@ impl Rest {
         self.after_run = ctx.state.econ.take_interrupted_run(now);
         self.moving_away = false;
         self.safe_tries = 0;
+        self.tried_supply = false;
         self.next_heal_ms = 0;
         self.move_away_from_monsters(ctx);
     }
@@ -90,7 +92,13 @@ impl Rest {
         if now >= self.end_ms || (now >= self.min_end_ms && recovered) {
             return GoalStatus::Done;
         }
-        self.try_heal(ctx);
+        if !normal_skills_blocked(ctx.state) {
+            if !self.tried_supply && crate::bot::guild::recovery::use_during_rest(ctx) {
+                self.tried_supply = true;
+                return GoalStatus::Running;
+            }
+            self.try_heal(ctx);
+        }
         // (a bot that rests in front of a player looks around and sits down)
         manner::rest_tick(ctx);
         GoalStatus::Running

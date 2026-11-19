@@ -66,7 +66,16 @@ fn plan() -> Plan {
         price: 40_000,
         to_bench_m: 100.0,
         carry_m: 200.0,
+        sea: false,
     }
+}
+
+#[test]
+fn a_trader_discounts_gross_quotes_by_failures_and_material_cost() {
+    let route = plan();
+    assert_eq!(route.trader_score(0, 0, 0), route.score());
+    assert!(route.trader_score(10_000, 0, 0) > route.score());
+    assert!(route.trader_score(0, 0, 2) > route.trader_score(0, 3, 2));
 }
 
 impl Fake {
@@ -134,6 +143,7 @@ impl Fake {
             parent_obj: 0,
             phase: 1,
             owner_id: 0,
+            plant_time: 0,
             quest_glow: 0,
             has_loot: false,
         }]));
@@ -154,6 +164,7 @@ impl Fake {
             parent_obj: 0,
             phase: 1,
             owner_id: 0,
+            plant_time: 0,
             quest_glow: 0,
             has_loot: false,
         }]));
@@ -170,6 +181,7 @@ impl Fake {
                 id: 9001,
                 grade: 0,
                 count: 1,
+                treasure: None,
             }],
             force_removed: SmallVec::new(),
         })));
@@ -292,6 +304,7 @@ fn bag_item(slot: u8, template: u32, count: i32) -> WorldEvent {
             id: 100 + u64::from(slot),
             grade: 0,
             count,
+            treasure: None,
         }],
         force_removed: SmallVec::new(),
     }))
@@ -306,6 +319,7 @@ fn npc(obj: u32, template: u32, x: f32, y: f32) -> UnitInfo {
         owner_name: "".into(),
         owner_id: 0,
         tl_id: 0,
+        slave_parent: 0,
         pos: (x, y, 100.0),
         level: 10,
         hp: 100,
@@ -418,8 +432,14 @@ fn a_gm_run_crafts_carries_sells_and_waits_for_the_payment() {
 
     // the pack leaves the backpack: sold, payment pending
     f.sell_pack();
+    assert!(
+        g.checkout_pending(),
+        "keep the goal until it observes the turn-in"
+    );
     steps(&mut g, &mut f, 1);
     assert_eq!(g.phase, Phase::Payment);
+    assert!(!g.checkout_pending());
+    assert_eq!(f.st.econ.packs_sold, 1);
     assert_eq!(f.st.econ.awaiting(), 1);
     assert_eq!(steps(&mut g, &mut f, 3), GoalStatus::Running);
 

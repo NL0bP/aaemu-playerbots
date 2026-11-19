@@ -68,6 +68,7 @@ const MAX_GM_MATERIALS: u32 = 600;
 const GM_ITEM_CHUNK: u32 = 1_000;
 /// The whole run must end within this long.
 const RUN_TIMEOUT_MS: u64 = 40 * 60_000;
+const SEA_RUN_TIMEOUT_MS: u64 = 90 * 60_000;
 /// How long a bench, buyer or craft that did not work stays out of the plans.
 const SKIP_MS: u64 = 30 * 60_000;
 
@@ -144,6 +145,8 @@ pub enum Named {
 
 /// What the state machine needs from the bot. [`Live`] wraps a [`Ctx`]; the tests use a fake.
 pub trait Env {
+    /// Records the outcome of a run for future decisions.
+    fn note_route(&mut self, _plan: &Plan, _sold: bool) {}
     /// The bot clock in milliseconds.
     fn now_ms(&self) -> u64;
     /// The bot's position.
@@ -207,6 +210,19 @@ pub trait Env {
 pub struct Live<'a, 'c>(pub &'a mut Ctx<'c>);
 
 impl Env for Live<'_, '_> {
+    fn note_route(&mut self, plan: &Plan, sold: bool) {
+        let materials = material_cost(self.0, plan.craft, crate::hub::unix_ms());
+        self.0.hub.journal.update(self.0.persona.id, |j| {
+            j.note_trade_route(
+                plan.item,
+                plan.buyer_tpl,
+                plan.sea,
+                plan.price,
+                materials,
+                sold,
+            );
+        });
+    }
     fn now_ms(&self) -> u64 {
         self.0.now_ms
     }
@@ -275,8 +291,10 @@ impl Env for Live<'_, '_> {
         let st = &*ctx.state;
         let (level, faction) = (st.me.level, st.me.faction);
         let world = ctx.world;
+        let assigned = crate::bot::guild::profession::trade_pack_order(ctx);
         let craft_ok = |c: &Craft| {
-            if st.econ.skipped(SkipKind::Craft, c.id, now) {
+            if assigned.is_some_and(|id| c.id != id) || st.econ.skipped(SkipKind::Craft, c.id, now)
+            {
                 return false;
             }
             if level < c.req_level && !gm {
@@ -294,6 +312,32 @@ impl Env for Live<'_, '_> {
         let bench_ok =
             |_tpl: u32, p: [f32; 2]| !st.econ.skipped(SkipKind::Bench, spot_key(p[0], p[1]), now);
         let buyer_ok = |npc: u32| !st.econ.skipped(SkipKind::Buyer, npc, now);
+        let trader = sea_trader(ctx);
+        let history = trader_history(ctx);
+        let at_ms = crate::hub::unix_ms();
+        let assignment =
+            trader.and_then(|id| ctx.cfg.guild.voyage_buyers.get(&id.to_string()).copied());
+        let sea = trader
+            .and_then(|_| super::sail::owned_trade_ship(ctx))
+            .and_then(|ship| {
+                let voyage_buyer =
+                    |npc| buyer_ok(npc) && assignment.is_none_or(|buyer| buyer == npc);
+                let query = Query {
+                    from: [me[0], me[1]],
+                    max_route_m: 16_000.0,
+                    radius_m: 3_000.0,
+                    craft_ok: &craft_ok,
+                    bench_ok: &bench_ok,
+                    buyer_ok: &voyage_buyer,
+                };
+                plan::candidates_at(world, &query, &|from, to| intercontinental(world, from, to))
+                    .into_iter()
+                    .take(8)
+                    .filter_map(|p| sea_plan(ctx, ship, p))
+                    .map(|p| (route_score(ctx, &p, history.as_deref(), at_ms), p))
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, p)| p)
+            });
         // Walking: the shortest budget that has a route; `/move` makes distances irrelevant.
         let budgets: &[f32] = if teleport {
             &[f32::INFINITY]
@@ -309,20 +353,36 @@ impl Env for Live<'_, '_> {
                 bench_ok: &bench_ok,
                 buyer_ok: &buyer_ok,
             };
-            let cands: Vec<Plan> = plan::candidates(world, &q)
-                .into_iter()
-                .filter(|p| {
-                    // a GM bot is levelled to the craft in Supply: judge the route at the level
-                    // the bot will have for the run, not at its current one
-                    let run_level = level.max(world.craft(p.craft).map_or(0, |c| c.req_level));
-                    !route_risky(world, faction, run_level, [me[0], me[1]], p)
-                })
-                .collect();
+            let mut cands: Vec<Plan> = plan::candidates_at(world, &q, &|from, to| {
+                trader.is_none() || !intercontinental(world, from, to)
+            })
+            .into_iter()
+            .filter(|p| {
+                // a GM bot is levelled to the craft in Supply: judge the route at the level
+                // the bot will have for the run, not at its current one
+                let run_level = level.max(world.craft(p.craft).map_or(0, |c| c.req_level));
+                !route_risky(world, faction, run_level, [me[0], me[1]], p)
+            })
+            .collect();
+            if let Some(history) = &history {
+                let mut ranked: Vec<_> = cands
+                    .drain(..)
+                    .map(|p| (route_score(ctx, &p, Some(history), at_ms), p))
+                    .collect();
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                cands.extend(ranked.into_iter().map(|(_, p)| p));
+            }
             if let Some(p) = plan::pick(&cands, ctx.rng) {
-                return Some(p);
+                return sea
+                    .filter(|s| {
+                        assignment.is_some()
+                            || route_score(ctx, s, history.as_deref(), at_ms)
+                                < route_score(ctx, &p, history.as_deref(), at_ms)
+                    })
+                    .or(Some(p));
             }
         }
-        None
+        sea
     }
 
     fn plan_carry(&mut self, item: u32) -> Option<Plan> {
@@ -331,7 +391,37 @@ impl Env for Live<'_, '_> {
         let me = ctx.state.me.pos;
         let st = &*ctx.state;
         let buyer_ok = |npc: u32| !st.econ.skipped(SkipKind::Buyer, npc, now);
-        plan::carry_only(ctx.world, item, [me[0], me[1]], &buyer_ok)
+        let world = ctx.world;
+        let from = [me[0], me[1]];
+        let Some(trader) = sea_trader(ctx) else {
+            return plan::carry_only(world, item, from, &buyer_ok);
+        };
+        let assignment = ctx
+            .cfg
+            .guild
+            .voyage_buyers
+            .get(&trader.to_string())
+            .copied();
+        let land = plan::carry_at(world, item, from, &buyer_ok, &|a, b| {
+            !intercontinental(world, a, b)
+        });
+        let sea = super::sail::owned_trade_ship(ctx).and_then(|ship| {
+            let voyage_buyer = |npc| buyer_ok(npc) && assignment.is_none_or(|buyer| buyer == npc);
+            plan::carry_at(world, item, from, &voyage_buyer, &|a, b| {
+                intercontinental(world, a, b)
+            })
+            .and_then(|p| sea_plan(ctx, ship, p))
+        });
+        let history = trader_history(ctx);
+        let at_ms = crate::hub::unix_ms();
+        sea.filter(|s| {
+            assignment.is_some()
+                || land.is_none_or(|l| {
+                    route_score(ctx, s, history.as_deref(), at_ms)
+                        < route_score(ctx, &l, history.as_deref(), at_ms)
+                })
+        })
+        .or(land)
     }
 
     fn send(&mut self, out: Out) {
@@ -365,6 +455,109 @@ impl Env for Live<'_, '_> {
     fn say(&self, text: &str) {
         self.0.log.say(text);
     }
+}
+
+fn sea_trader(ctx: &Ctx<'_>) -> Option<u32> {
+    use crate::bot::guild::profession::{membership, Profession};
+    if !ctx.cfg.sail.trade_passages {
+        return None;
+    }
+    match membership(ctx) {
+        Some((id, Profession::Trader, false)) => Some(id),
+        _ => None,
+    }
+}
+
+fn trader_history(ctx: &Ctx<'_>) -> Option<Vec<crate::journal::TradeRoute>> {
+    use crate::bot::guild::profession::{membership, Profession};
+    matches!(membership(ctx), Some((_, Profession::Trader, false))).then(|| {
+        ctx.hub
+            .journal
+            .read(ctx.persona.id, |journal| journal.trade_routes.clone())
+    })
+}
+
+fn material_cost(ctx: &Ctx<'_>, recipe: u32, now_ms: u64) -> Option<u32> {
+    let recipe = ctx.world.craft(recipe)?;
+    let total = recipe
+        .materials
+        .iter()
+        .try_fold(0.0, |total, &(item, count)| {
+            let price = ctx.hub.market_prices.average(item, now_ms).or_else(|| {
+                let facts = ctx.world.item_facts(item)?;
+                (facts.price > 0).then_some(facts.price as f32)
+            })?;
+            Some(total + price * count as f32)
+        })?;
+    Some(total.ceil() as u32)
+}
+
+fn route_score(
+    ctx: &Ctx<'_>,
+    plan: &Plan,
+    history: Option<&[crate::journal::TradeRoute]>,
+    now_ms: u64,
+) -> f32 {
+    let Some(history) = history else {
+        return plan.score();
+    };
+    let (sold, failed) = history
+        .iter()
+        .find(|r| r.item == plan.item && r.buyer == plan.buyer_tpl && r.sea == plan.sea)
+        .map_or((0, 0), |r| (r.sales, r.failed_runs));
+    plan.trader_score(
+        material_cost(ctx, plan.craft, now_ms).unwrap_or(0),
+        sold,
+        failed,
+    )
+}
+
+fn intercontinental(world: &aa_world::World, a: [f32; 2], b: [f32; 2]) -> bool {
+    let continent = |p: [f32; 2]| {
+        world
+            .zone_key_at(p[0], p[1])
+            .map_or(0, |zone| world.travel().portals.continent_of_zone(zone))
+    };
+    let (origin, destination) = (continent(a), continent(b));
+    matches!(origin, 3..=5) && matches!(destination, 3..=5) && origin != destination
+}
+
+fn sea_plan(ctx: &Ctx<'_>, ship: aa_world::travel::ShipClass, mut plan: Plan) -> Option<Plan> {
+    let world = ctx.world;
+    let faction = ctx.state.me.faction;
+    let level = ctx.state.me.level;
+    let buyer = world.npc(plan.buyer_tpl)?;
+    if world.relation(faction, buyer.faction_id) == Relation::Hostile
+        || world.zone_closed_at(plan.buyer[0], plan.buyer[1])
+    {
+        return None;
+    }
+    let passage = super::sail::plan_trade_passage(ctx, ship, plan.bench, plan.buyer)?;
+    let buyer_at = (plan.buyer[0], plan.buyer[1]);
+    let bench_at = (plan.bench[0], plan.bench[1]);
+    let [x, y, _] = ctx.pos();
+    for (from, to) in [
+        ((x, y), bench_at),
+        (bench_at, passage.launch.stand),
+        (passage.landing.stand, buyer_at),
+    ] {
+        if progress::deadly(world, faction, level, from, to)
+            || plan::crosses_hostile_zone([from.0, from.1], [to.0, to.1], &mut |x, y| {
+                world.zone_closed_at(x, y)
+                    || world.zone_info_at(x, y).is_some_and(|z| {
+                        z.faction != 0 && world.relation(faction, z.faction) == Relation::Hostile
+                    })
+            })
+        {
+            return None;
+        }
+    }
+    let shore_walk = (bench_at.0 - passage.launch.stand.0)
+        .hypot(bench_at.1 - passage.launch.stand.1)
+        + (buyer_at.0 - passage.landing.stand.0).hypot(buyer_at.1 - passage.landing.stand.1);
+    plan.carry_m = shore_walk + passage.route_m * (4.0 / ship.top_speed.max(1.0));
+    plan.sea = true;
+    Some(plan)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -452,8 +645,10 @@ pub fn unavailable(ctx: &Ctx<'_>) -> Option<&'static str> {
         return Some(LEVEL_TOO_LOW);
     }
     let st = &*ctx.state;
+    let assigned = crate::bot::guild::profession::trade_pack_order(ctx);
     let possible = ctx.world.pack_crafts().any(|c| {
-        level >= c.req_level
+        assigned.is_none_or(|id| c.id == id)
+            && level >= c.req_level
             && labor >= i32::from(c.labor) + SELL_LABOR
             && c.materials
                 .iter()
@@ -479,11 +674,9 @@ pub fn pack_busy(ctx: &Ctx<'_>) -> bool {
     // (a note past its deadline no longer holds the bot: the recovery writes it off when the run
     // next looks at it, but nothing else may wait for that)
     carried_pack_of(ctx).is_some()
-        || ctx
-            .state
-            .econ
-            .lost_pack()
-            .is_some_and(|lost| ctx.now_ms < lost.until_ms)
+        || ctx.state.econ.lost_pack().is_some_and(|lost| {
+            ctx.now_ms < lost.until_ms && !ctx.world.specialty_buyers(lost.item).is_empty()
+        })
 }
 
 /// The goals that are not drawn while [`pack_busy`]: every goal but the trade run. A carrying
@@ -524,10 +717,12 @@ pub fn route_risky(
 }
 
 /// Craft, carry and sell trade packs. See the module docs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct TradeRun {
     phase: Phase,
     plan: Option<Plan>,
+    sea_passage: Option<Box<super::Sail>>,
+    sea_complete: bool,
     /// The one-line description for the web UI.
     text: Box<str>,
     end_ms: u64,
@@ -561,7 +756,12 @@ impl TradeRun {
 
     /// One tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
-        let status = self.step(&mut Live(ctx));
+        let status = match self.plan {
+            Some(plan) if plan.sea && self.phase == Phase::ToBuyer && !self.sea_complete => {
+                self.sail_to_buyer(ctx, &plan)
+            }
+            _ => self.step(&mut Live(ctx)),
+        };
         self.finished |= status != GoalStatus::Running;
         if matches!(self.phase, Phase::ToBench | Phase::ToBuyer | Phase::Recover) {
             // On the way: the combat controller only fights back against close attackers.
@@ -570,10 +770,59 @@ impl TradeRun {
         status
     }
 
+    fn sail_to_buyer(&mut self, ctx: &mut Ctx<'_>, plan: &Plan) -> GoalStatus {
+        if ctx.now_ms >= self.end_ms {
+            return self.fail(
+                &mut Live(ctx),
+                FailReason::Timeout,
+                "the passage took too long",
+            );
+        }
+        if !carries(ctx.state, plan.item) {
+            return self.fail(
+                &mut Live(ctx),
+                FailReason::NoTarget,
+                "the trade pack is gone",
+            );
+        }
+        let passage = self.sea_passage.get_or_insert_with(|| {
+            let mut sail = Box::<super::Sail>::default();
+            sail.start_trade_passage(ctx, plan.buyer);
+            sail
+        });
+        match passage.tick(ctx) {
+            GoalStatus::Running => GoalStatus::Running,
+            GoalStatus::Done => {
+                passage.stop(ctx);
+                self.sea_passage = None;
+                self.sea_complete = true;
+                GoalStatus::Running
+            }
+            GoalStatus::Failed(why) => {
+                self.skip_buyer(&mut Live(ctx), plan);
+                self.fail(&mut Live(ctx), why, "could not sail to the buyer")
+            }
+        }
+    }
+
+    pub fn owns_combat(&self) -> bool {
+        self.sea_passage
+            .as_ref()
+            .is_some_and(|sail| sail.owns_combat())
+    }
+
+    /// The pack can leave inventory before this goal records the turn-in on its next tick.
+    pub fn checkout_pending(&self) -> bool {
+        self.phase == Phase::Selling
+    }
+
     /// Called when the goal ends. A run that is cut short while the bot carries a pack is noted
     /// in the ledger: the goal that takes over (a rest) can give the run back afterwards, see
     /// [`carried_pack_of`].
     pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(mut passage) = self.sea_passage.take() {
+            passage.stop(ctx);
+        }
         if ctx.motion.is_moving() {
             ctx.motion.stop();
         }
@@ -585,6 +834,11 @@ impl TradeRun {
 
     /// Appends what the bot is doing.
     pub fn describe(&self, out: &mut String) {
+        if let Some(passage) = &self.sea_passage {
+            out.push_str("Trade run by sea, ");
+            passage.describe(out);
+            return;
+        }
         out.push_str(&self.text);
     }
 
@@ -611,6 +865,11 @@ impl TradeRun {
 
     /// Leaves the run: the reason goes to the web UI's event log.
     fn fail(&mut self, env: &mut dyn Env, why: FailReason, text: &'static str) -> GoalStatus {
+        if self.phase != Phase::Payment {
+            if let Some(plan) = self.plan {
+                env.note_route(&plan, false);
+            }
+        }
         env.say(&format!("trade run failed: {text}"));
         let why = match why {
             FailReason::Other(_) => FailReason::Other(text),
@@ -724,6 +983,10 @@ impl TradeRun {
             return self.fail(env, FailReason::NoTarget, "no route within reach");
         };
         self.plan = Some(plan);
+        self.sea_complete = false;
+        if plan.sea {
+            self.end_ms = self.end_ms.max(env.now_ms() + SEA_RUN_TIMEOUT_MS);
+        }
         self.retries = 0;
         self.close = false;
         let item = env.name(Named::Item, plan.item);
@@ -1158,6 +1421,7 @@ impl TradeRun {
         };
         if !carries(env.state(), plan.item) {
             env.state_mut().econ.note_sale();
+            env.note_route(&plan, true);
             env.say(&format!(
                 "trade run: sold {} to {}, the payment is coming by mail",
                 env.name(Named::Item, plan.item),
@@ -1267,6 +1531,8 @@ pub fn collect_payments(ctx: &mut Ctx<'_>) {
         ctx.find(crate::bot::watch::Finding::Payment { fault });
     }
     if let Some(p) = paid {
+        use crate::bot::{cmd::GoalKind, guild::treasury};
+        treasury::note_receipt(ctx, GoalKind::TradeRun, p.money.max(0) as u64);
         let mut text = format!(
             "trade run: payment collected, {}",
             coins(i64::from(p.money))

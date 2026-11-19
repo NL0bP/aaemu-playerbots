@@ -69,6 +69,8 @@ pub enum PartyPurpose {
     /// Sign the charter of a new guild: the leader founds it, the others sign (the guild feature,
     /// [`super::guild`]).
     Guild,
+    /// Make a short open-world trip together.
+    Field(FieldActivity),
     /// Lie in wait together for trade pack carriers (the gank goal, see
     /// [`pvp::squad`](super::pvp::squad)).
     Ambush {
@@ -77,6 +79,14 @@ pub enum PartyPurpose {
         /// The leader's post, whole metres (y).
         y: i32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldActivity {
+    Explore,
+    Forage,
+    Grind,
+    Quest,
 }
 
 /// The coordinator's order to one member of a party.
@@ -121,6 +131,7 @@ impl PartyOrder {
             PartyPurpose::Dungeon { zone_group } => zone_group,
             // (a charter has no dungeon)
             PartyPurpose::Guild => 0,
+            PartyPurpose::Field(_) => 0,
             PartyPurpose::Ambush { .. } => 0,
         }
     }
@@ -706,15 +717,25 @@ fn dist((ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
 /// Every wish in turn, longest-waiting first, is a seed; for each dungeon its bot can run, the
 /// planner takes other bots of the same alliance that can run it too, up to the dungeon's player
 /// limit ([`Site::max_party`], never more than [`MAX_PARTY`]) and within a distance that grows
-/// with the waiting time. A tank and a healer are preferred before the nearest damage dealers, so
-/// the party gets the mix it needs. A full party is formed at once; a party of [`RALLY_MIN`] or
-/// more starts after [`RALLY_WINDOW_SECS`] of rallying for one more; a smaller one
-/// ([`MIN_PARTY`]) only after the seed waited `relax_after_secs`. Among the dungeons the cheapest
+/// with the waiting time. It fills tank and healer roles first and favors compatible levels and
+/// familiar members. A full party is formed at once. A party of [`RALLY_MIN`] or more starts
+/// after [`RALLY_WINDOW_SECS`] of rallying for one more. A smaller one ([`MIN_PARTY`]) waits
+/// until the seed has waited `relax_after_secs`. Among the dungeons the cheapest
 /// wins (walking distance to the entrance plus a level-mismatch penalty); the leader is a tank
 /// when there is one, else the member with the highest level (the stable sort keeps the seed
 /// first on a tie). Without GM travel a dungeon farther than [`WALK_NEAR_M`] (growing with the
 /// waiting time) is out of reach.
 pub fn plan(wishes: &[(Wish, u64)], sites: &[Site], relax_after_secs: u64) -> Option<Formation> {
+    plan_with(wishes, sites, relax_after_secs, |_, _| 0)
+}
+
+/// Forms a party using the trust between wishes. A score at or below -40 vetoes the pairing.
+pub fn plan_with(
+    wishes: &[(Wish, u64)],
+    sites: &[Site],
+    relax_after_secs: u64,
+    trust: impl Fn(usize, usize) -> i8,
+) -> Option<Formation> {
     let mut seeds: SmallVec<[usize; 16]> = (0..wishes.len()).collect();
     seeds.sort_by_key(|&i| std::cmp::Reverse(wishes[i].1));
     for seed in seeds {
@@ -732,47 +753,47 @@ pub fn plan(wishes: &[(Wish, u64)], sites: &[Site], relax_after_secs: u64) -> Op
                         && w.fits(site)
                         && dist(w.at, sw.at) <= near
                 })
-                .map(|(j, (w, _))| (dist(w.at, sw.at), j))
+                .map(|(j, (w, _))| {
+                    let level_gap = f32::from(w.level.abs_diff(sw.level));
+                    let familiar = f32::from(trust(seed, j).max(0));
+                    (dist(w.at, sw.at) + 35.0 * level_gap - 2.0 * familiar, j)
+                })
                 .collect();
-            mates.sort_by(|a, b| a.0.total_cmp(&b.0));
-            // one tank, one healer, then the nearest of the rest (when the seed already is one,
-            // that place is filled by a damage dealer instead)
-            let need = want.saturating_sub(1);
-            let mut picked: SmallVec<[usize; MAX_PARTY]> = SmallVec::new();
-            for role in [PartyRole::Tank, PartyRole::Healer] {
-                if picked.len() >= need {
-                    break;
-                }
-                let already = sw.role == role || picked.iter().any(|&j| wishes[j].0.role == role);
-                if already {
-                    continue;
-                }
-                if let Some(pos) = mates.iter().position(|&(_, j)| wishes[j].0.role == role) {
-                    picked.push(mates.remove(pos).1);
-                }
+            let mut members: SmallVec<[usize; MAX_PARTY]> = smallvec::smallvec![seed];
+            while members.len() < want {
+                let role_priority = |index: usize| {
+                    let role = wishes[index].0.role;
+                    if members.iter().any(|&m| wishes[m].0.role == role) {
+                        return 2;
+                    }
+                    match role {
+                        PartyRole::Tank => 0,
+                        PartyRole::Healer => 1,
+                        PartyRole::Dps => 2,
+                    }
+                };
+                let next = mates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, mate))| members.iter().all(|&m| trust(m, *mate) > -40))
+                    .min_by(|(_, a), (_, b)| {
+                        role_priority(a.1)
+                            .cmp(&role_priority(b.1))
+                            .then_with(|| a.0.total_cmp(&b.0))
+                            .then_with(|| a.1.cmp(&b.1))
+                    })
+                    .map(|(i, _)| i);
+                let Some(next) = next else { break };
+                members.push(mates.swap_remove(next).1);
             }
-            for &(_, j) in mates.iter() {
-                if picked.len() >= need {
-                    break;
-                }
-                picked.push(j);
-            }
-            let size = picked.len() + 1;
-            let youngest = picked
-                .iter()
-                .map(|&j| wishes[j].1)
-                .chain(std::iter::once(waited))
-                .min()
-                .unwrap_or(waited);
+            let size = members.len();
+            let youngest = members.iter().map(|&j| wishes[j].1).min().unwrap_or(waited);
             let full = size >= want;
             let rallied = size >= RALLY_MIN.min(want) && youngest >= RALLY_WINDOW_SECS;
             let relaxed = size >= MIN_PARTY && waited >= relax_after_secs;
             if !(full || rallied || relaxed) {
                 continue;
             }
-            let mut members: SmallVec<[usize; MAX_PARTY]> = SmallVec::new();
-            members.push(seed);
-            members.extend(picked);
             // far dungeons need GM travel from everyone
             let walkers = members.iter().filter(|&&m| !wishes[m].0.jump).count();
             let entrance_m: f32 = members
@@ -790,7 +811,7 @@ pub fn plan(wishes: &[(Wish, u64)], sites: &[Site], relax_after_secs: u64) -> Op
             }
             let cost = entrance_m + LEVEL_WEIGHT_M * mismatch;
             if best.as_ref().is_none_or(|b| cost < b.0) {
-                // the leader: a tank first, then a healer, then the highest level
+                // A tank leads when possible, with the highest level preferred.
                 members.sort_by_key(|&m| {
                     (
                         wishes[m].0.role.lead_rank(),
@@ -1481,6 +1502,46 @@ mod tests {
             let i = w.iter().position(|x| x.0.bot == b).unwrap();
             w[i].0.level <= lead_level
         }));
+    }
+
+    #[test]
+    fn a_party_fills_roles_without_pairing_rivals_and_prefers_a_familiar_attacker() {
+        let sites = [site(0, 50, 18, 55, 4, (0.0, 0.0))];
+        let w = [
+            at_secs(wish(1, (0.0, 0.0), 20), 10),
+            at_secs(wish(2, (5.0, 0.0), 20), 0),
+            at_secs(wish(3, (25.0, 0.0), 20), 0),
+            at_secs(
+                Wish {
+                    role: PartyRole::Healer,
+                    ..wish(4, (60.0, 0.0), 20)
+                },
+                0,
+            ),
+            at_secs(
+                Wish {
+                    role: PartyRole::Tank,
+                    ..wish(5, (70.0, 0.0), 20)
+                },
+                0,
+            ),
+            at_secs(
+                Wish {
+                    role: PartyRole::Tank,
+                    ..wish(6, (10.0, 0.0), 20)
+                },
+                0,
+            ),
+        ];
+        let trust = |a: usize, b: usize| match (a.min(b), a.max(b)) {
+            (0, 2) => 20,
+            (0, 5) => -50,
+            _ => 0,
+        };
+        let f = plan_with(&w, &sites, RELAX_AFTER_SECS, trust).unwrap();
+        let mut picked = bots(&f, &w);
+        picked.sort_unstable();
+        assert_eq!(picked, [1, 3, 4, 5]);
     }
 
     #[test]

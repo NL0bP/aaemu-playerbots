@@ -323,6 +323,283 @@ invitation (and a whisper that says so); a member that cannot invite names an of
 real player's line in guild chat is answered by one bot with a canned line. With
 `accept_player_invites` a bot that is in no guild accepts a real player's invitation too.
 
+**Professions.** Assign existing server guild IDs in `[guild]`. For example:
+
+```toml
+work_percent = 60
+professions = { "42" = "potato", "43" = "trader" }
+farm_orders = { "42" = 12345 }
+```
+
+Potato members favor farming and market work, traders favor trade runs and auctions, thieves
+favor ambushes, adventurers favor dungeons and grinding, and bounty hunters favor war zones.
+Each activity uses its existing switches and prerequisites. A Potato order supplies a seed or
+produce template for new plantings on protected land. Existing ripe crops are tended first.
+Set `farm_choices` to compare up to twelve seeds per Potato guild. Members use the last week's
+confirmed market sales to estimate profit per growing hour and fall back to `farm_orders` when
+there is too little price evidence. Guild planting uses up to half the configured plot count per
+site, rounded up. Thief members look for ripe crops on wild plots when alone and
+`[farm] steal` is enabled. The director also sees recent average prices for a Trader's sales.
+
+Potato guilds can use nearby member-owned gardens configured under `[guild] farm_leases` when
+the owner shares the property with the guild in game. Use the server's house ID. Set `rent_copper`
+to charge for each confirmed planting on a new leased plot. Rent joins the next express-mail
+contribution and requires a configured treasury. It defaults to zero. Enable `farm.own_land`
+along with farming so bots consider gardens.
+
+With ambushes enabled, Thief members avoid auctioneer districts and favor parts of trade routes
+where they previously recovered packs.
+Crafter, Gatherer and Adventurer members can run `work` for a configured production order. Use
+`production_orders = { "44" = { kind = "craft", recipe = 123 } }` for a Crafter guild, or
+`{ "45" = { kind = "gather", doodad = 456, item = 789 } }` for a Gatherer guild.
+Crafting and gathering need compatible world templates, a nearby visible bench or node, and
+sufficient labor. Gatherers can also walk to a nearby authored source and wait for the node to
+appear. Use `member_production_orders = { "44" = { "8" = { kind = "craft", recipe = 123 } } }`
+to assign a specific recipe to character ID 8 in guild 44. Members without an individual order
+follow their guild's order. Set `{ "46" = { kind = "hunt", item = 789, count = 4 } }` for an Adventurer
+guild. Members look for nearby hostile monsters that can drop the tradeable material and
+replenish stock until the server confirms the requested quantity in their bags.
+
+With `[guild] dispatch_orders = true`, a guildmaster bot can change a member bot's production
+through a native whisper. An agent controlling the guildmaster can use its `whisper` command
+with `guild work craft <recipe> [training-recipe]`, `guild work gather <doodad> <item>`, or
+`guild work hunt <item> <quantity>`, according to the guild's profession. The member records the
+order in its journal and uses it until the guildmaster replaces it or sends `guild work clear`.
+It checks the server guild roster and rejects incompatible orders. A pending player commission
+holds the current recipe until the commission ends.
+With trade ads enabled, Gatherer and Adventurer orders can also request missing material from
+players and other bots. The order advertises a fixed price of 90 percent of recent confirmed
+sales when their average is at least 25 percent above the usual asking price. The normal trade
+checks and spending limits apply.
+Crafting reads proficiency from the server. Set `training_recipe` alongside `recipe` to practice a
+lower-tier recipe in the same vocation until the main recipe's requirement is met. Crafter members
+with trade-chat shopping enabled seek missing materials for their current recipe using the normal
+market prices and trade confirmation.
+
+With `[guild] player_craft_orders = true` and `[market] enabled = true`, a nearby player can
+whisper a Crafter member `craft Stone Brick for 100c`. The item must be the tradeable output of
+the member's assigned recipe. The Crafter makes one batch using its own supplies and holds it
+for the buyer for up to one hour. The player whispers `craft collect` when nearby or sends a trade
+request, then pays the agreed amount in the trade window. They can withdraw the order with
+`craft cancel`. Each member handles one order at a time and saves it across restarts.
+
+Set `[guild] player_craft_material_max_copper` above zero to let members buy recipe inputs from
+the customer. For example, whisper `craft Stone Brick for 100c with materials for 40c`. The
+Crafter lists the exact ingredients. With `craft materials`, the customer trades those ingredients
+for 40 copper, then pays 100 copper when collecting the finished batch. The 40 copper purchase is
+final when the materials trade completes. The guild's market commission uses the confirmed sale
+less the ingredient payment.
+
+The guildmaster skips the profession's autonomous goals and continues to manage recruitment and
+membership. Members recover personal time after each professional goal based on its actual elapsed
+time. The percentage applies over completed work and recovery periods during a bot run. Existing
+commitments can finish. Trader and Crafter guilds decline bots with recorded Thief membership.
+With `[farm] husbandry = true`, Potato guild members can fill orders for supported livestock or
+their produce. They raise livestock on their own land or a ranch that accepts the animal. For
+each actual animal phase, the bot can feed, treat or collect eggs, milk or wool and keeps a record
+when the game confirms the action.
+Bounty hunters with warzone play enabled check recent sightings after a hostile character kills
+a trade runner carrying a pack. Hunters prioritize eligible targets in view during war patrols.
+If a bot witnessed a player's death while they carried a trade pack, that player can whisper
+`bounty RaiderName` to a nearby Bounty Hunter guild member or guildmaster on their side. The
+guild adds the matching report to its patrols while the case remains open. A witness report
+can open a case automatically when another bot died carrying a pack.
+The game must credit the kill to a hunter before the report is cleared and recorded in memory.
+Set `bounty_reward_copper` on the guild treasury to pay hunters for those confirmed kills.
+Rewards use express mail and the guildmaster's collected funds. An unpaid amount carries
+forward when the treasury cannot cover it and still protect its reserve.
+The director sees the role, work availability and configured orders. When trade runs are eligible
+it also sees recent route outcomes and gross price estimates. External agents see the work summary
+as `guild_work` in `observe`.
+
+Set `treasuries = { "43" = { weekly_dues_copper = 100, commission_percent = 5, reserve_copper = 10000 } }`
+to collect contributions for a configured guild with a bot as guildmaster. A member at level 10 or
+higher pays once per week when within reach of a mailbox and able to cover the contribution and
+postage while keeping its reserve. Confirmed trade-pack and auction receipts for Traders, fish
+stand receipts for Gatherers, and sales through the market for members doing market work accrue
+commission. The guildmaster claims the coins from express
+mail sent by members. `observe` reports the total claimed as `guild_copper_received`.
+
+Give a treasury a `weekly_support_copper` amount to pay a weekly allowance to each bot member
+by express mail. Apprentices receive the base amount. Members, officers and commanders receive
+two, three and four times the base. When the guildmaster is at a mailbox, it pays from confirmed
+contributions collected that week, including the cost of postage, and keeps the reserve intact.
+Bot members collect allowances from their guildmaster. The director remembers receipts so it can
+consider the added buying power when deciding what to do.
+
+Thief, Adventurer and Bounty Hunter guilds can set `recovery_supplies = { "42" = [
+{ item = 8518, unit_copper = 800, stock = 2 },
+{ item = 8524, unit_copper = 1000, stock = 3, min_rank = 2 } ] }` under `[guild]`. The first entry
+applies to apprentices and members. Officers and commanders instead request the higher-rank
+entry if it restores the same pool. A member with a rank allowance and trade ads enabled buys
+up to its stock target at the listed price, using confirmed allowance money above the purse
+reserve. The journal charges the allowance after the inventory and coin both confirm the trade.
+Members hold these items for rest and can use one per rest when low on the pool it restores.
+Valid items use an authored self-targeted health or mana restoration skill.
+Set `fund_gear = true` on a guild's treasury terms to let members spend their
+remaining rank allowance on merchant gear when `[gear] enabled` and `buy` are on. This can
+cover a piece above the ordinary personal spending limit. Purchases still require enough
+copper above the reserve. Gear and recovery supplies draw from the same allowance, and gear
+charges require both the new item and the quoted purse debit.
+
+Set `[guild] treasure_hunts = true` to let Thief and Bounty Hunter guild members hunt for treasure.
+With an owned coordinate map and at least 50 labor, a bot can walk to its authored dig site up to
+600 metres away on land outside closed or active war zones. It digs and takes the chest after
+the server consumes the map and exposes the loot. A bot with a Freedich Island Treasure Chest
+Key can also open a nearby Pirate Treasure Chest. The journal counts server-confirmed loot, the
+director sees the hunt count, and confirmed copper is eligible for the guild's commission.
+
+A Trader guild with a configured `trade_pack_orders` recipe can set `trade_loan_copper` on its
+treasury. A member who cannot afford the estimated cost of tradable ingredients can request up
+to that amount. The guildmaster sends at most one advance per member per week from confirmed
+contributions. New advances wait while the member owes principal. Confirmed trade-pack payments
+in copper reserve an amount for repayment after commission. Members include it in their next
+weekly contribution, or send a separate repayment that week if they already contributed. Both
+the advance and repayment use express mail.
+
+Set `[guild] auction_flips = true` to let Trader members buy and relist one auction lot at a time.
+The bot uses recent confirmed market sales, keeps its configured copper reserve, and requires
+a projected margin after listing fees and the auction tax. It relists the purchased stack when
+the item arrives by mail. When the sale proceeds arrive, the confirmed profit goes into the
+member's next guild contribution.
+
+Set `[guild] siege_zones = { "43" = [33] }` and enable PvP to let a bot-led guild participate
+in announced castle sieges. Use server guild IDs and dominion zone group IDs. Bots register
+during warmup from outside the castle and wait for the battle phase before approaching the
+tower. Attackers fight the tower and use the game's engraving skill when it is exposed.
+Defenders can engage enrolled attackers under the existing PvP target settings. Only the
+server's territory update counts as a capture or successful defense, and the director remembers
+those results. This goal requires a server with an active siege and access to that castle zone.
+
+For declarations, list approved camp placement positions in `[guild] siege_declarations`. Each
+entry gives a configured siege `zone_group` and a world `[x, y]` `position` outside the tower's
+declaration exclusion radius. During the announced declaration period, a bot guildmaster with
+the matching siege camp in its inventory can walk to the position and cast the camp's skill.
+The server confirms the declaration before the bot records it. Set the server's castle zone
+access for ordinary declarers before enabling this goal. You can supply camps separately or set
+`[guild] siege_camp_bids = { "43" = 5000000 }` to let the master of guild 43 bid on the matching system
+lot during the advertised auction period. The value is a copper ceiling. The bot keeps its
+treasury reserve, makes one bid attempt per cycle, and claims a win through normal auction mail.
+
+Use `[guild] territory_patrols` to designate nearby roads and resource sites for guilds that
+hold a castle. Each guild's entries give a `zone_group` and its world `[x, y]` `position`. With
+warzone play enabled, members prioritize reachable sites in active conflict, patrol their
+surroundings and use the usual PvP rules. These patrols use guild work time and stop after the
+guild loses its last configured castle.
+
+Add `[guild] rift_patrols = { "43" = [3] }` to give a castle-holding guild an occasional
+patrol around an announced rift. The values are authored event IDs, such as `3` for Crimson
+Rift. Members can engage eligible opponents within 130 metres of the rally point while the
+zone is at war. They leave when the event or war ends, or after six minutes, and wait at least
+45 minutes before taking another rift patrol. The cooldown survives reconnects.
+
+With `[behavior] settlement_visits = true`, idle wander goals sometimes choose a nearby friendly
+auctioneer and stroll around the market. They can also visit an authored innkeeper, bench or
+campfire within reach. Add other places with `settlement_hangouts = [[x, y], ...]`. Bots linger
+at resting places for 30 to 55 seconds and can sit when their usual emote rules allow it. The
+director can choose a nearby settlement visit.
+
+### Sport fishing
+
+Set `[behavior] sport_fishing = true` to enable the `fish` goal. Start with a sport-fishing
+rod, lure item 27319, labor, an empty backpack equipment slot, and baked terrain. The bot can
+equip a rod from its bag and switch back to its previous weapon afterwards. A bot in range
+of an active school can cast into the water, reel in its own fish, loot the catch, and travel
+to a stand that accepts that fish. An already-equipped fish goes straight to turn-in. Fish stand
+eligibility, the sale skill, and the expected copper payment come from the compact database.
+The journal records a sale after the catch leaves the backpack slot and the purse receives the
+expected payment. Agents can read `fish_turn_ins` and `fish_sale_copper` in `observe`.
+
+A bot within casting range of an inactive school can apply a compatible chum item from its bag.
+It waits for the rod-change lockout and for the server's school phase update before casting a lure,
+then matches the reel actions to the hooked fish's movement.
+With freshwater chum, a bot within 450 metres of a known freshwater school can walk to a
+nearby bank. The route requires baked terrain and a point where both the chum and lure can reach
+the water.
+
+With settlement visits and ambient social chat enabled, a bot standing near an auctioneer can
+remark in local chat on the lowest buyout it recently saw for an item. It uses the server's
+quote and the normal ambient chat limits.
+
+### Message deliveries
+
+With `[behavior] delivery_contracts = true` and social chat enabled, a player within 30 metres
+of a bot can whisper `deliver Farsignal Meet me at the market`. The recipient must be another
+online bot within 850 metres. The courier accepts one delivery at a time, travels to the
+recipient, whispers the message in person, and tells the requester it has handed it off.
+The requester can whisper `deliver cancel`. Orders survive bot restarts and expire after 20
+minutes. External agents can see the recipient and handoff count in `observe`.
+
+With the same setting, a Thief guild member can take `spy Farsignal` from a nearby player.
+It travels within sight of the named bot and reports where it was seen and whether it was carrying
+a trade pack. A sighting uses the member's guild work time and adds a journal note and a
+`scouting_reports` count. The requester can whisper `spy cancel`.
+With sport fishing and PvP ambushes enabled, Thief guild members can also raid eligible rivals
+carrying a landed sport fish. They can recover a dropped catch and use a fish stand to sell it.
+
+Whisper `mediate` to ask whether the bot has a disagreement you can help resolve. If it
+remembers a negative relationship with another nearby bot, it can ask you to visit them.
+Whisper `mediate Vonurn` to that bot with the original bot's name. Only you can carry out
+that request. The other bot decides whether to accept based on trust and temperament, and a
+successful conversation eases existing grudges without turning them into positive trust.
+The outcome is recorded in both journals and the request expires after 20 minutes.
+
+### Sea trade runs
+
+With `[sail] trade_passages = true` and `[behavior] sailing = true`, a Trader guild member with
+its configured boat scroll can consider same-faction or neutral buyers on another continent.
+The bot checks both beaches, the water route and the land legs before choosing the run. It
+keeps its pack equipped while sailing to the buyer, then uses the ordinary sale and mail flow.
+The planner considers the ship's speed when comparing the route with a land run. Set `[sail]
+ship = "auto"` if the bots own different boats. An optional `[guild] voyage_buyers` entry
+prioritizes a buyer NPC template for that guild when a viable passage is available.
+Set `[guild] trade_pack_orders = { "43" = 6223 }` to assign a particular pack recipe to a
+Trader guild. Members at the required level advertise for missing tradable ingredients when
+trade chat is enabled. The recipe's quantities stay in the bag during ordinary sales, and new
+trade runs use the assigned recipe. The director sees the recipe and the number of missing
+ingredients. Bots already carrying a pack can still sell it.
+Trader guild members also compare gross quotes with estimated material replacement costs and
+recorded failures on the route. Bot memory records land and sea runs separately and exposes the
+last quote and available cost estimate to the director.
+
+With `[sail] naval_raids = true`, an eligible Thief guild member at level 35 or higher can use
+the cannons on its own sailing ship. The bot needs Steel Ammo and an accessible cannon. When a
+hostile ship and its owner are visible in the same active war zone, the bot checks the normal
+PvP target rules, slows, mans a cannon and fires up to three shots at the hull. It leads moving
+ships using their reported velocity, then returns to the helm. The director sees confirmed hits
+in the bot's memory. These sailing trips count against its guild work time.
+
+### Trade escorts
+
+With `[party] trade_escorts = true`, the leader of a player party can whisper `escort` to an Adventurer
+guild member in that party. Start within 45 metres of the bot with a trade pack or landed sport
+catch equipped. The bot follows and assists through the normal party combat rules until both
+reach an eligible trade buyer or fish stand.
+When PvP and the relevant target type are enabled, the escort can also defend the carrier against a
+nearby hostile character after seeing it land a hit.
+The escort uses professional work time and ends if the pack is lost, the party breaks up, or 20
+minutes elapse. The leader can whisper `escort cancel`. Agents can read `escorts_completed`.
+
+Set `[party] loot_share_requests = true` to let a companion ask a player loot master for
+a share. The bot asks by whisper once per party after the server reports the Master Looter rule.
+The player can assign items through the game's loot controls.
+Bots also remember seeing a party member enable Bloodlust. Lawful personalities lose more
+trust, and repeated toggles have a 15-minute cooldown for each relationship.
+Nearby companions with at least 20 trust get up to 10 percent off a seller's asking price
+when they reply to a trade advertisement by whisper. The seller keeps its normal minimum price.
+
+### Open-world bot parties
+
+Set `[behavior] field_parties = true` to offer the `field_party` goal. The coordinator gathers
+two to four bots of the same alliance within 120 metres and five levels of each other. It favors
+familiar characters, compatible attitudes toward outlaw activity, and a mix of party roles.
+Bots skip teammates they strongly distrust and leave if trust falls that far during a trip.
+Outgoing, dedicated bots tend to lead. The coordinator gives their preferences double weight
+when it chooses exploration, questing, grinding, or foraging. Foraging requires a leader with an
+available Gatherer order and guild work time. The leader gathers up to three confirmed sources
+while the party stays together. The leader announces the plan in party chat, and followers stay
+nearby and assist with fights. More sociable bots tend to stay longer.
+
 **See it.** The web UI's bot list carries each bot's guild with its members (`guild` in
 `/api/bots`); the bot's log has the `guild:` lines (invited, joined, handed over, left). Server
 behaviour that contradicts the protocol (an accepted invitation that never became a membership, a
@@ -452,10 +729,19 @@ party chat of the members of the bot's party (never from the bots of this proces
 | `leave` | leaves the party (the leader only) |
 | `dungeon <name>` | walks to the entrance of the dungeon and waits there; the leader only; the name is matched by the beginning of its words ("which one?" when it names several) |
 | `inv`, `invite me` (whisper, from anyone) | invites the speaker to its party, if the policy above allows it and the bot owns its party or has none |
+| `remember dungeons` (whisper, party member) | remembers a preferred activity. Also accepts `questing`, `grinding`, `exploring`, `farming` and `trading` |
+| `forget preference` (whisper, party member) | clears the speaker's saved preference |
 
 Filler words are ignored ("follow me", "come here pls"); a line of more than six words is
 conversation, not a command. The bot answers by whisper with a short natural line (a late joiner of a
 team gets no party chat from the server, so nothing is said there).
+
+**Memory.** The journal keeps the last 32 character relationships, including shared parties,
+trust and a stated activity preference. Confirmed party play earns trust and being killed
+outside a duel costs trust. At −40 or below the bot declines the known character's party invite.
+Dungeon matchmaking favors familiar, similarly leveled bots and fills tank and healer roles when
+possible. It excludes pairs when either side distrusts the other. A private LLM reply can use the
+sender's own remembered preference. External agents can read `relationships` in `observe`.
 
 **Roles.** A bot announces its party role on joining (`CSSetTeamMemberRole`): tank for tanks, healer
 for healers, attacker for the rest. In a dungeon party the role also decides who leads (a tank
@@ -506,7 +792,8 @@ ship = "cutter"    # rowboat (default) | clipper | cutter | junk | yawl | schoon
 * `rowboat` is the default and behaves as before. A scroll in the bag is used; without one a bot
   needs `bots.gm_bootstrap` (it adds the scroll with `/item add self`).
 * `clipper` (6.5 m/s), `cutter` and `junk` (6.3 m/s), `yawl` (9.8 m/s) and `schooner` (6.5 m/s, the
-  merchant ship) sail with the driver only: no crew, cannons or cargo yet. `auto` uses the
+  merchant ship) sail with one pilot. Thieves can use their ship's cannon with
+  `[sail] naval_raids = true`. `auto` uses the
   family of a scroll the bag holds, else gives each bot a boat of its own (mostly rowboats and
   clippers, some cutters and junks, merchants like the schooner).
 * A big hull needs room. The bot looks for a beach (within 1500 m of where it stands) where the
@@ -996,9 +1283,9 @@ playerbots run --config playerbots.toml
 * **Director.** With `llm.director = true` each bot asks, about every `director_interval_secs`
   (jittered), what to do next, given a short summary of its level, health, zone, money,
   personality, recent goals, surroundings, how many zones it has seen and its last notes. It is
-  offered at most ten numbered options: the goals it may pick right now (not switched off, not
-  cooling down, no GM-only goal without `gm_bootstrap`), best first, and concrete variants it can do
-  now:
+  offered at most ten numbered options, best first. The bot uses its normal goal eligibility
+  checks, including the required items or an owned house for housing on regular characters. The
+  menu also includes concrete variants it can do now:
 
   | Option | Offered when |
   | --- | --- |

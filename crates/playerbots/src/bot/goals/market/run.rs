@@ -13,10 +13,12 @@ use super::report::{self, Transfer};
 use crate::bot::cmd::{PairKind, PairOrder, PairRole};
 use crate::bot::ctx::Ctx;
 use crate::bot::goals::trade::{Deal, Plan, Trade};
+use crate::bot::goals::work::training;
 use crate::bot::goals::{FailReason, GoalStatus};
+use crate::bot::guild::{land, supply};
 use crate::bot::market::ads::lines::{Meet, Speech};
 use crate::bot::market::ads::talk::{Closed, Role};
-use crate::bot::market::ads::{AdState, Agreed};
+use crate::bot::market::ads::{AdState, Agreed, Funding};
 use crate::bot::market::needs::QuestNeeds;
 use crate::bot::motion::{MotionStatus, Pace};
 use crate::bot::state::{StateError, UnitKind};
@@ -43,6 +45,7 @@ struct Audit {
     qty: i64,
     total: i64,
     seller: bool,
+    funding: Option<Funding>,
     items_before: i64,
     money_before: i64,
 }
@@ -278,8 +281,7 @@ impl Run {
         let unit = unit_named(ctx, &d.peer);
         let money = i32::try_from(total).ok();
         // (a quest taken since the deal may need the goods: those are not for sale any more)
-        let free = count(ctx, template)
-            - i64::from(QuestNeeds::of(ctx.world, &ctx.state.quests).count(template));
+        let free = count(ctx, template) - i64::from(QuestNeeds::for_bot(ctx).count(template));
         let plan = money.and_then(|money| {
             if seller {
                 if free < qty {
@@ -306,7 +308,33 @@ impl Run {
                     money,
                 ))
             } else {
-                (ctx.state.me.money >= total).then_some((
+                let can_pay = ctx.state.me.money >= total
+                    && match d.funding {
+                        Some(Funding::Training(guild)) => {
+                            training::can_pay(ctx, guild, template, d.qty, d.unit)
+                        }
+                        Some(Funding::FarmLand(guild)) => {
+                            land::can_pay(ctx, guild, template, d.qty, d.unit)
+                        }
+                        Some(Funding::Fishing(guild)) => {
+                            crate::bot::goals::fish::supplies::can_pay(
+                                ctx, guild, template, d.qty, d.unit,
+                            )
+                        }
+                        Some(Funding::SupplyContract(guild, id)) => {
+                            unit.is_some_and(|(_, _, character)| {
+                                supply::permits_supplier(
+                                    &ctx.cfg.guild,
+                                    &ctx.hub.guilds,
+                                    d.funding,
+                                    &d.peer,
+                                    Some(character),
+                                )
+                            }) && supply::can_pay(ctx, guild, id, template, d.qty, d.unit)
+                        }
+                        None => true,
+                    };
+                can_pay.then_some((
                     Plan {
                         slot: 0,
                         template: 0,
@@ -330,7 +358,11 @@ impl Run {
         } else {
             &[(template, i32::try_from(qty).unwrap_or(i32::MAX))]
         };
-        let deal = Deal::agreed(give, items, ask_money);
+        let deal = if d.funding.is_some() {
+            Deal::fixed(give, items, ask_money)
+        } else {
+            Deal::agreed(give, items, ask_money)
+        };
         let order = PairOrder {
             kind: PairKind::Trade,
             role: if seller {
@@ -350,6 +382,7 @@ impl Run {
             qty,
             total,
             seller,
+            funding: d.funding,
             items_before: count(ctx, template),
             money_before: ctx.state.me.money,
         });
@@ -587,7 +620,52 @@ impl Run {
             want_money,
             got_money: money,
         };
-        if t.is_complete() {
+        let complete = if a.funding.is_some() {
+            items == want_items && money == want_money
+        } else {
+            t.is_complete()
+        };
+        if complete {
+            if a.seller {
+                use crate::bot::{cmd::GoalKind, guild::treasury};
+                treasury::note_receipt(ctx, GoalKind::Market, a.total.max(0) as u64);
+                if ctx.cfg.guild.enabled && !ctx.cfg.guild.professions.is_empty() {
+                    let sale = crate::bot::guild::prices::Receipt {
+                        item: a.template,
+                        quantity: a.qty as u32,
+                        copper: a.total as u32,
+                        at_ms: crate::hub::unix_ms(),
+                    };
+                    ctx.hub.market_prices.remember(sale);
+                    ctx.hub.journal.update(ctx.persona.id, |j| {
+                        j.market_sales.insert(0, sale);
+                        j.market_sales.truncate(24);
+                    });
+                }
+            } else {
+                match a.funding {
+                    Some(Funding::Training(guild)) => {
+                        training::note_purchase(ctx, guild, a.template, a.qty, a.total as u64)
+                    }
+                    Some(Funding::FarmLand(guild)) => {
+                        land::note_purchase(ctx, guild, a.qty, a.total as u64)
+                    }
+                    Some(Funding::Fishing(guild)) => {
+                        crate::bot::goals::fish::supplies::note_purchase(
+                            ctx,
+                            guild,
+                            a.qty,
+                            a.total as u64,
+                        )
+                    }
+                    Some(Funding::SupplyContract(guild, id)) => {
+                        supply::note_purchase(ctx, guild, id, a.template, a.qty, a.total)
+                    }
+                    None => {
+                        crate::bot::guild::recovery::note_purchase(ctx, a.template, a.qty, a.total)
+                    }
+                }
+            }
             ctx.log.say(format!(
                 "market: the trade checks out ({items:+} items, {money:+} copper)"
             ));

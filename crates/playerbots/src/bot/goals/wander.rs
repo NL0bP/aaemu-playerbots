@@ -33,8 +33,121 @@ const WALK_CHANCE: f32 = 0.3;
 const MAX_FAILS: u8 = 3;
 /// The bot counts as there within this many metres of the place it was sent to.
 const ARRIVE_M: f32 = 8.0;
+/// A rounded agent destination can still identify an authored resting place.
+const HANGOUT_MATCH_M: f32 = 2.0;
 /// The longest trip to the place it was sent to, in milliseconds.
 pub const TRAVEL_MAX_MS: u64 = 20 * 60_000;
+
+/// A friendly market reachable on an ordinary outing.
+pub fn settlement_market(ctx: &Ctx<'_>) -> Option<[f32; 2]> {
+    if !ctx.cfg.behavior.settlement_visits || ctx.state.place.in_instance() {
+        return None;
+    }
+    let [x, y, z] = ctx.pos();
+    let faction = ctx.state.me.faction;
+    let market = ctx
+        .world
+        .nearest_auctioneer(aa_world::Vec3::new(x, y, z), 850.0, |a| {
+            let p = a.pos;
+            p.dist2d(aa_world::Vec3::new(x, y, z)) < 25.0
+                || ctx.in_war_zone(p.x, p.y)
+                || !ctx.world.npc(a.template).is_some_and(|npc| {
+                    ctx.world.relation(faction, npc.faction_id) != aa_world::Relation::Hostile
+                })
+                || super::quest::progress::cut_off(ctx.world, (x, y), (p.x, p.y))
+                || super::quest::progress::deadly(
+                    ctx.world,
+                    faction,
+                    ctx.state.me.level,
+                    (x, y),
+                    (p.x, p.y),
+                )
+        })?;
+    Some([market.pos.x, market.pos.y])
+}
+
+/// A configured or authored place to linger within the bot's local area.
+pub fn settlement_hangout(ctx: &Ctx<'_>) -> Option<[f32; 2]> {
+    if !ctx.cfg.behavior.settlement_visits || ctx.state.place.in_instance() {
+        return None;
+    }
+    let [x, y, z] = ctx.pos();
+    let faction = ctx.state.me.faction;
+    let mut best = None;
+    let mut consider = |[a, b]: [f32; 2]| {
+        let distance = (a - x).hypot(b - y);
+        if (15.0..=850.0).contains(&distance)
+            && best.is_none_or(|(nearer, _)| distance < nearer)
+            && !ctx.in_war_zone(a, b)
+            && super::walkable(ctx.world, a, b)
+            && !super::quest::progress::cut_off(ctx.world, (x, y), (a, b))
+            && !super::quest::progress::deadly(
+                ctx.world,
+                faction,
+                ctx.state.me.level,
+                (x, y),
+                (a, b),
+            )
+        {
+            best = Some((distance, [a, b]));
+        }
+    };
+    for &point in &ctx.cfg.behavior.settlement_hangouts {
+        consider(point);
+    }
+    // Look for actual innkeepers and quiet furnishings in the authored district.
+    let here = aa_world::Vec3::new(x, y, z);
+    ctx.world.npc_spawns_within(here, 425.0, |template, pos| {
+        if is_friendly_innkeeper(ctx.world, faction, template) {
+            consider([pos.x, pos.y]);
+        }
+    });
+    ctx.world
+        .doodad_spawns_within(here, 225.0, |template, pos| {
+            if is_settlement_furnishing(ctx.world, template) {
+                consider([pos.x, pos.y]);
+            }
+        });
+    best.map(|(_, at)| at)
+}
+
+fn is_friendly_innkeeper(world: &aa_world::World, faction: u32, template: u32) -> bool {
+    world.npc(template).is_some_and(|npc| {
+        npc.name.contains("Innkeeper")
+            && world.relation(faction, npc.faction_id) != aa_world::Relation::Hostile
+    })
+}
+
+fn is_settlement_furnishing(world: &aa_world::World, template: u32) -> bool {
+    world.doodad(template).is_some_and(|doodad| {
+        matches!(
+            doodad.name.as_ref(),
+            "Campfire" | "Small Campfire" | "Long Wood Bench" | "Wooden Bench"
+        )
+    })
+}
+
+fn is_settlement_hangout(ctx: &Ctx<'_>, target: [f32; 2]) -> bool {
+    if ctx.state.place.in_instance() {
+        return false;
+    }
+    if ctx.cfg.behavior.settlement_hangouts.contains(&target) {
+        return true;
+    }
+    let at = aa_world::Vec3::new(target[0], target[1], 0.0);
+    let mut found = false;
+    ctx.world
+        .npc_spawns_within(at, HANGOUT_MATCH_M, |template, _| {
+            found |= is_friendly_innkeeper(ctx.world, ctx.state.me.faction, template);
+        });
+    if !found {
+        ctx.world
+            .doodad_spawns_within(at, HANGOUT_MATCH_M, |template, _| {
+                found |= is_settlement_furnishing(ctx.world, template);
+            });
+    }
+    found
+}
 
 /// Strolling around. See the module docs.
 #[derive(Debug, Default, Clone)]
@@ -51,6 +164,8 @@ pub struct Wander {
     /// When the trip to `target` is given up.
     travel_until_ms: u64,
     walker: Walker,
+    lingering: bool,
+    rest_at_target: bool,
 }
 
 impl Wander {
@@ -72,6 +187,14 @@ impl Wander {
 
     /// Called once when the brain picks the goal.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
+        self.rest_at_target = false;
+        if self.target.is_none() && ctx.cfg.behavior.settlement_visits && ctx.rng.u8(0..4) == 0 {
+            let hangout = settlement_hangout(ctx);
+            self.rest_at_target = hangout.is_some();
+            self.target = hangout.or_else(|| settlement_market(ctx));
+        } else if let Some(target) = self.target.filter(|_| ctx.cfg.behavior.settlement_visits) {
+            self.rest_at_target = is_settlement_hangout(ctx, target);
+        }
         self.home = ctx.pos();
         self.end_ms = ctx.now_ms + jitter_ms(ctx.rng, TOTAL_MS.0, TOTAL_MS.1);
         self.pause_until_ms = ctx.now_ms + jitter_ms(ctx.rng, 500, 3_000);
@@ -109,9 +232,17 @@ impl Wander {
             return GoalStatus::Done;
         }
         if now < self.pause_until_ms {
+            if self.lingering {
+                manner::rest_tick(ctx);
+                return GoalStatus::Running;
+            }
             // (in front of a player the bot looks around while it pauses)
             manner::wander_pause(ctx);
             return GoalStatus::Running;
+        }
+        if self.lingering {
+            manner::rest_end(ctx);
+            self.lingering = false;
         }
         match random_point(ctx.world, ctx.rng, self.home, LEG_MIN_M, LEG_MAX_M, 8)
             .filter(|&(x, y)| !ctx.in_war_zone(x, y))
@@ -150,9 +281,16 @@ impl Wander {
             Walk::There => {
                 // (the stroll's clock starts on arrival)
                 self.target = None;
+                ctx.motion.face(t[0], t[1]);
                 self.home = ctx.pos();
                 self.end_ms = now + jitter_ms(ctx.rng, TOTAL_MS.0, TOTAL_MS.1);
-                self.pause_until_ms = now + jitter_ms(ctx.rng, PAUSE_MS.0, PAUSE_MS.1);
+                self.lingering = self.rest_at_target;
+                self.pause_until_ms = if self.lingering {
+                    manner::rest_begin(ctx);
+                    now + jitter_ms(ctx.rng, 30_000, 55_000)
+                } else {
+                    now + jitter_ms(ctx.rng, PAUSE_MS.0, PAUSE_MS.1)
+                };
                 GoalStatus::Running
             }
         }
@@ -160,6 +298,9 @@ impl Wander {
 
     /// Called when the goal ends.
     pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
+        if self.lingering {
+            manner::rest_end(ctx);
+        }
         if self.walking || self.target.is_some() {
             ctx.motion.stop();
             self.walking = false;
@@ -172,6 +313,8 @@ impl Wander {
             let _ = write!(out, "heading for {:.0}, {:.0}", t[0], t[1]);
         } else if self.walking {
             let _ = write!(out, "strolling to {:.0}, {:.0}", self.dest.0, self.dest.1);
+        } else if self.lingering {
+            out.push_str("resting at a settlement stop");
         } else {
             out.push_str("looking around");
         }

@@ -1128,8 +1128,9 @@ while it walks, the server's own NPCs ten (one per AI tick), both at an even pac
   `bots.move_update_ms` (125 ms, about eight a second), evenly: between two brain ticks
   (`bots.tick_ms`) the bot loop wakes for a movement-only tick (`Bot::on_motion_tick`; the
   schedule is the pure `bot::next_wake_ms`) that moves the bot on and sends the update, nothing
-  else. A moving update is due within 20 ms of its gap (`SEND_SLACK_MS`), so a timer that wakes a
-  little early does not skip one. A bot nobody can see sends one update a second.
+  else. Movement deadlines are computed from the last movement packet. An earlier brain tick
+  keeps the same deadline, and the socket flush does not add time to the scheduled wake.
+  A bot nobody can see sends an update on the first brain tick after a second.
 - **Who can see it.** The server shows a unit to the players in its own 64 m region and the eight
   around it, up to about 181 m away; a real character within `VIEW_RADIUS` (190 m) counts. The
   watch radius of the life-like movement and the chat stays 150 m.
@@ -1331,7 +1332,8 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
   scroll is not consumed by the cast.
 - **Limits**: sea only; the bot that is made to leave the goal at sea (a forced goal, a rest) is left
   swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done;
-  the bigger hulls sail with their driver only (no crew, no cannons, no cargo yet).
+  the bigger hulls sail with one pilot. For an enabled Thief raid, that pilot temporarily moves
+  from the helm to a cannon, then returns to the helm.
 - **Tests**: the water mask, the planner (detour, no route, discs), the shore and launch finders,
   the heading controller (also with an inverted wheel and other hulls), the route follower, and the
   whole machine against a scripted server (`goals/sail/tests.rs`: a rowboat, a clipper and a

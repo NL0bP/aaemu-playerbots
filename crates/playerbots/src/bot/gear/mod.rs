@@ -549,6 +549,7 @@ pub fn rules(ctx: &Ctx<'_>) -> Rules {
         socket: g.socket,
         regrade: g.regrade && gm,
         max_spend_pct: g.max_spend_pct,
+        guild_budget: super::guild::treasury::gear_allowance(ctx).map_or(0, |(_, budget)| budget),
     }
 }
 
@@ -630,6 +631,7 @@ fn check(ctx: &mut Ctx<'_>) {
     let r = rules(ctx);
     let facts = ctx.world.gear();
     let fit = Fit::of(&ctx.persona.archetype);
+    let reserved = super::goals::work::customer::gear_reservation(ctx);
     let st: &mut BotState = ctx.state;
     let Some(mut mem) = st.gear.take() else {
         return;
@@ -638,6 +640,9 @@ fn check(ctx: &mut Ctx<'_>) {
     let worn = worn_of(st, Some(&mem), facts, &fit);
     let mut bag = std::mem::take(&mut mem.scratch);
     bag_of(st, Some(&mem), facts, &mut bag);
+    if let Some((template, stock)) = reserved {
+        bag.retain(|item| item.template != template || stock.is_some_and(|id| id != item.id));
+    }
     let (level, gender) = (st.me.level, st.me.gender);
     let pick = eval::best_move(
         &worn,

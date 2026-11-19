@@ -21,13 +21,15 @@
 //! * The goal ends at the next tick after the zone group turns to peace (or is about to), and
 //!   the kills of the war are counted per `(zone group, end of the state)`.
 
-use aa_proto::sc_world::conflict_state;
+use aa_proto::{sc_event::EventId, sc_world::conflict_state};
 use aa_world::World;
 use pb_web::Activity;
 use smallvec::SmallVec;
 
 use crate::bot::combat::{CombatStatus, LostReason};
 use crate::bot::ctx::Ctx;
+use crate::bot::guild::profession::{self, Profession};
+use crate::bot::pvp::bounties::Case;
 use crate::bot::pvp::fight::{self, Odds};
 use crate::bot::pvp::rules;
 use crate::bot::pvp::scan;
@@ -81,6 +83,9 @@ const SKIP_MS: u64 = 45_000;
 const REGROUP_MAX_MS: u64 = 3 * 60_000;
 /// Lost fights in a row (the target got away) after which the bot looks elsewhere.
 const MAX_LOST: u8 = 4;
+const RIFT_PATROL_COOLDOWN_MS: u64 = 45 * 60_000;
+const RIFT_PATROL_MS: u64 = 6 * 60_000;
+const RIFT_PATROL_RADIUS: f32 = 130.0;
 
 /// Warzone: fight for the faction in zones at war. See the module docs.
 #[derive(Debug, Default)]
@@ -190,8 +195,12 @@ pub fn score(ctx: &Ctx<'_>, _base: f32) -> f32 {
     {
         return 0.0;
     }
-    if wars(ctx).is_empty() {
+    let available = wars(ctx);
+    if available.is_empty() {
         return 0.0;
+    }
+    if territory_patrol(ctx, |group| available.iter().any(|war| war.group == group)).is_some() {
+        return 2.0;
     }
     weight(&ctx.persona.temper)
 }
@@ -335,6 +344,74 @@ fn standable(world: &World) -> impl Fn([f32; 2]) -> bool + '_ {
     move |s| super::walkable(world, s[0], s[1])
 }
 
+pub fn bounty(ctx: &Ctx<'_>, matches: impl Fn(&Case) -> bool) -> Option<Case> {
+    if !matches!(
+        profession::membership(ctx),
+        Some((_, Profession::BountyHunter, false))
+    ) {
+        return None;
+    }
+    ctx.hub.bounties.find(
+        crate::hub::unix_ms(),
+        ctx.world.mother_faction(ctx.state.me.faction),
+        matches,
+    )
+}
+
+pub(super) fn bounty_whisper(ctx: &mut Ctx<'_>, line: &crate::bot::state::ChatIn) -> bool {
+    if !(ctx.cfg.pvp.enabled && ctx.cfg.pvp.warzone)
+        || line.kind != aa_proto::cs::chat_type::WHISPER
+        || ctx.state.me.dead
+        || ctx.state.place.in_instance()
+    {
+        return false;
+    }
+    let Some((verb, target)) = line.text.trim().split_once(' ') else {
+        return false;
+    };
+    if !verb.eq_ignore_ascii_case("bounty") {
+        return false;
+    }
+    let Some((requester, who)) = super::delivery::nearby_requester(ctx, line) else {
+        return false;
+    };
+    let alliance = ctx.world.mother_faction(ctx.state.me.faction);
+    let on_same_side = ctx
+        .state
+        .units
+        .get(&line.sender_obj)
+        .is_some_and(|u| alliance != 0 && ctx.world.mother_faction(u.faction) == alliance);
+    if !on_same_side
+        || !matches!(
+            profession::membership(ctx),
+            Some((_, Profession::BountyHunter, _))
+        )
+    {
+        super::delivery::tell(
+            ctx,
+            who,
+            "A Bounty Hunter guild on your side can take the case.",
+        );
+        return true;
+    }
+    if let Some(case) =
+        ctx.hub
+            .bounties
+            .request(crate::hub::unix_ms(), alliance, requester, target.trim())
+    {
+        super::delivery::tell(ctx, who, &format!("I put a bounty on {} for the trade pack ambush. We'll look for them when the area is at war.", case.name));
+        ctx.log
+            .say(format!("bounty: took a case on {} from {who}", case.name));
+    } else {
+        super::delivery::tell(
+            ctx,
+            who,
+            "We need a witness to your trade pack ambush before we can take the case.",
+        );
+    }
+    true
+}
+
 /// The zone groups at war that the bot may join now, with their distance and the bot's kills.
 fn wars(ctx: &Ctx<'_>) -> SmallVec<[War; 8]> {
     let mut out: SmallVec<[War; 8]> = SmallVec::new();
@@ -378,6 +455,115 @@ fn wars(ctx: &Ctx<'_>) -> SmallVec<[War; 8]> {
     out
 }
 
+fn territory_site(
+    ctx: &Ctx<'_>,
+    available: impl Fn(u16) -> bool,
+) -> Option<crate::config::TerritoryPatrol> {
+    let [x, y, _] = ctx.pos();
+    crate::bot::guild::siege::patrol_sites(ctx)
+        .iter()
+        .copied()
+        .filter_map(|site| {
+            let [sx, sy] = site.position;
+            let distance = (sx - x).hypot(sy - y);
+            (available(site.zone_group)
+                && (distance <= WALK_REACH_M || ctx.would_teleport(distance))
+                && standable(ctx.world)(site.position)
+                && ctx
+                    .world
+                    .zone_info_at(sx, sy)
+                    .is_some_and(|zone| zone.group == site.zone_group))
+            .then_some((site, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(site, _)| site)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerritoryAssignment {
+    site: crate::config::TerritoryPatrol,
+    rift: Option<(EventId, u64)>,
+}
+
+fn territory_patrol(ctx: &Ctx<'_>, available: impl Fn(u16) -> bool) -> Option<TerritoryAssignment> {
+    let definitions = crate::bot::guild::siege::rift_patrols(ctx);
+    if !definitions.is_empty()
+        && ctx.hub.events.any()
+        && ctx.hub.journal.read(ctx.persona.id, |journal| {
+            crate::hub::unix_ms() >= journal.rift_patrol_after_ms
+        })
+    {
+        let [x, y, _] = ctx.pos();
+        let nearest = ctx
+            .hub
+            .events
+            .views()
+            .iter()
+            .filter_map(|view| {
+                let id = view.id;
+                if view.step == 0 || !definitions.contains(&id.def) || !available(id.zone_group) {
+                    return None;
+                }
+                let def = ctx.world.events().get(id.def)?;
+                let [rx, ry, _] = super::event::live_rally(ctx, def, view)?;
+                let distance = (rx - x).hypot(ry - y);
+                let site = crate::config::TerritoryPatrol {
+                    zone_group: id.zone_group,
+                    position: [rx, ry],
+                };
+                ((distance <= WALK_REACH_M || ctx.would_teleport(distance))
+                    && standable(ctx.world)(site.position)
+                    && ctx
+                        .world
+                        .zone_info_at(rx, ry)
+                        .is_some_and(|z| z.group == id.zone_group))
+                .then_some((
+                    TerritoryAssignment {
+                        site,
+                        rift: Some((id, view.first_seen_ms)),
+                    },
+                    distance,
+                ))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((assignment, _)) = nearest {
+            return Some(assignment);
+        }
+    }
+    territory_site(ctx, available).map(|site| TerritoryAssignment { site, rift: None })
+}
+
+fn rival_guild(ctx: &Ctx<'_>, rivals: &[u32], object: u32, unix_ms: u64) -> Option<u32> {
+    if rivals.is_empty() {
+        return None;
+    }
+    let character = ctx.state.unit(object)?;
+    let bot = ctx.hub.bot_id_of(character.id)?;
+    let card = ctx.hub.guilds.card(bot, unix_ms)?;
+    rivals.contains(&card.guild).then_some(card.guild)
+}
+
+pub fn territory_patrol_ready(ctx: &Ctx<'_>) -> bool {
+    if !(ctx.cfg.pvp.enabled && ctx.cfg.pvp.warzone) {
+        return false;
+    }
+    let now = unix_now_s();
+    territory_patrol(ctx, |group| {
+        let Some((state, end)) = ctx.state.zone_state(group) else {
+            return false;
+        };
+        let kills = ctx
+            .state
+            .pvp
+            .as_ref()
+            .map_or(0, |p| p.war_kills(group, end));
+        ctx.world.is_conflict_group(group)
+            && conflict_state::at_war(state)
+            && worth_joining(time_left_s(end, now), kills, ctx.cfg.pvp.war_kill_cap)
+    })
+    .is_some()
+}
+
 // ---- the machine -------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +604,7 @@ struct Machine {
     phase_ms: u64,
     /// Where the bot walks to (the spot of the zone group).
     spot: Option<[f32; 2]>,
+    territory: Option<TerritoryAssignment>,
     target: u32,
     name: Box<str>,
     eval_ms: u64,
@@ -438,6 +625,7 @@ impl Machine {
             end_ms: now_ms + GOAL_MAX_MS,
             phase_ms: now_ms,
             spot: None,
+            territory: None,
             target: 0,
             name: "".into(),
             eval_ms: 0,
@@ -466,6 +654,23 @@ impl Machine {
             return self.fail(ctx, FailReason::Timeout, "it took too long");
         }
         if self.phase != Phase::Plan {
+            if self
+                .territory
+                .is_some_and(|assignment| match assignment.rift {
+                    Some((id, seen)) => {
+                        !crate::bot::guild::siege::rift_patrols(ctx).contains(&id.def)
+                            || !ctx
+                                .hub
+                                .events
+                                .view(id)
+                                .is_some_and(|view| view.first_seen_ms == seen)
+                    }
+                    None => crate::bot::guild::siege::patrol_sites(ctx).is_empty(),
+                })
+            {
+                self.outcome = Outcome::Over;
+                return GoalStatus::Done;
+            }
             let at_war = ctx.state.at_war(self.group);
             let left = time_left_s(self.end_unix_s, unix_now_s());
             if war_over(at_war, left) {
@@ -498,10 +703,39 @@ impl Machine {
         let now = ctx.now_ms;
         let list = wars(ctx);
         let roll = ctx.rng.usize(..2);
-        let Some(war) = pick_war(&list, roll) else {
+        let me = ctx.state.me.pos;
+        let lead = bounty(ctx, |c| {
+            let dist = (c.last_seen[0] - me[0]).hypot(c.last_seen[1] - me[1]);
+            list.iter().any(|war| war.group == c.group)
+                && (ctx.would_teleport(dist) || dist <= WALK_REACH_M)
+                && standable(ctx.world)(c.last_seen)
+        });
+        let assigned = territory_patrol(ctx, |group| list.iter().any(|war| war.group == group));
+        let chosen = lead
+            .as_ref()
+            .and_then(|case| list.iter().find(|war| war.group == case.group).copied())
+            .or_else(|| {
+                list.iter()
+                    .find(|war| assigned.is_some_and(|a| a.site.zone_group == war.group))
+                    .copied()
+            })
+            .or_else(|| {
+                let rivals = crate::bot::guild::profession::war_rivals(ctx);
+                if rivals.is_empty() {
+                    return None;
+                }
+                let group = ctx.world.zone_info_at(me[0], me[1])?.group;
+                let war = list.iter().find(|war| war.group == group)?;
+                let unix = crate::hub::unix_ms();
+                scan::hunted(ctx, HUNT_M)
+                    .iter()
+                    .any(|candidate| rival_guild(ctx, rivals, candidate.obj, unix).is_some())
+                    .then_some(*war)
+            })
+            .or_else(|| pick_war(&list, roll));
+        let Some(war) = chosen else {
             return self.fail(ctx, FailReason::NoTarget, "no war to join");
         };
-        let me = ctx.state.me.pos;
         let near: SmallVec<[([f32; 2], f32); 3]> = nearest_spots(
             ctx.world.zone_group_spots(war.group),
             [me[0], me[1]],
@@ -510,7 +744,33 @@ impl Machine {
         if near.is_empty() {
             return self.fail(ctx, FailReason::NoTarget, "no spot in the zone group");
         }
-        let (spot, _) = near[ctx.rng.usize(..near.len())];
+        let spot = if let Some(case) = lead {
+            ctx.log.say(format!(
+                "bounty patrol: checking the last sighting of {}",
+                case.name
+            ));
+            case.last_seen
+        } else if let Some(assignment) = assigned {
+            self.territory = Some(assignment);
+            if let Some((id, _)) = assignment.rift {
+                self.end_ms = now + RIFT_PATROL_MS;
+                ctx.hub.journal.update(ctx.persona.id, |journal| {
+                    journal.rift_patrol_after_ms = crate::hub::unix_ms() + RIFT_PATROL_COOLDOWN_MS;
+                });
+                ctx.log.say(format!(
+                    "rift patrol: heading for event {} in zone group {}",
+                    id.def, war.group
+                ));
+            } else {
+                ctx.log.say(format!(
+                    "territory patrol: covering the guild site in zone group {}",
+                    war.group
+                ));
+            }
+            assignment.site.position
+        } else {
+            near[ctx.rng.usize(..near.len())].0
+        };
         self.group = war.group;
         self.end_unix_s = war.end_unix_s;
         self.kills = war.kills;
@@ -532,7 +792,11 @@ impl Machine {
             return GoalStatus::Running;
         };
         // (anyone met on the way is fair game once the bot is in the zone group)
-        if self.in_zone(ctx) {
+        if self.in_zone(ctx)
+            && !self
+                .territory
+                .is_some_and(|a| a.rift.is_some() && !near_rift(a, ctx.pos()))
+        {
             if let Some(status) = self.look_around(ctx) {
                 return status;
             }
@@ -576,10 +840,30 @@ impl Machine {
         }
         if self.spot.is_none() {
             let me = ctx.state.me.pos;
+            let local;
+            let points = if let Some([x, y]) = self.territory.map(|a| a.site.position) {
+                local = [
+                    [x, y],
+                    [x + 65.0, y],
+                    [x - 65.0, y],
+                    [x, y + 65.0],
+                    [x, y - 65.0],
+                ];
+                &local[..]
+            } else {
+                ctx.world.zone_group_spots(self.group)
+            };
             self.spot = patrol_spot(
-                ctx.world.zone_group_spots(self.group),
+                points,
                 [me[0], me[1]],
-                standable(ctx.world),
+                |[x, y]| {
+                    standable(ctx.world)([x, y])
+                        && (self.territory.is_none()
+                            || ctx
+                                .world
+                                .zone_info_at(x, y)
+                                .is_some_and(|zone| zone.group == self.group))
+                },
                 ctx.rng,
             );
             self.walker.reset();
@@ -602,8 +886,45 @@ impl Machine {
     /// Looks for a character to fight; `Some` when the tick is decided.
     fn look_around(&mut self, ctx: &mut Ctx<'_>) -> Option<GoalStatus> {
         let now = ctx.now_ms;
-        let cands = scan::hunted(ctx, HUNT_M);
-        let c = cands.iter().min_by(|a, b| a.dist.total_cmp(&b.dist))?;
+        let mut cands = scan::hunted(ctx, HUNT_M);
+        if let Some(assignment) = self.territory.filter(|a| a.rift.is_some()) {
+            cands.retain(|c| {
+                ctx.state
+                    .unit(c.obj)
+                    .is_some_and(|u| near_rift(assignment, u.pos))
+            });
+        }
+        let lead = bounty(ctx, |case| {
+            cands.iter().any(|c| {
+                ctx.state
+                    .units
+                    .get(&c.obj)
+                    .is_some_and(|u| u.id == case.target)
+            })
+        });
+        let rivals = crate::bot::guild::profession::war_rivals(ctx);
+        let unix = crate::hub::unix_ms();
+        let (c, rival) = lead
+            .and_then(|case| {
+                cands.iter().find(|c| {
+                    ctx.state
+                        .units
+                        .get(&c.obj)
+                        .is_some_and(|u| u.id == case.target)
+                })
+            })
+            .map(|candidate| (candidate, None))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .map(|candidate| (candidate, rival_guild(ctx, rivals, candidate.obj, unix)))
+                    .min_by(|(a, a_guild), (b, b_guild)| {
+                        a_guild
+                            .is_none()
+                            .cmp(&b_guild.is_none())
+                            .then_with(|| a.dist.total_cmp(&b.dist))
+                    })
+            })?;
         let obj = c.obj;
         let odds = scan::weigh(ctx, obj);
         let hp = ctx.state.me.hp_pct();
@@ -618,6 +939,10 @@ impl Machine {
         }
         match verdict {
             Engage::Attack => {
+                if let Some(guild) = rival {
+                    ctx.log
+                        .say(format!("warzone: prioritizing rival guild {guild}"));
+                }
                 if ctx.motion.is_moving() {
                     ctx.motion.stop();
                 }
@@ -654,6 +979,19 @@ impl Machine {
     fn fight(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
         let target = self.target;
+        if self
+            .territory
+            .filter(|a| a.rift.is_some())
+            .is_some_and(|assignment| {
+                ctx.state
+                    .unit(target)
+                    .is_some_and(|unit| !near_rift(assignment, unit.pos))
+            })
+        {
+            ctx.combat.disengage();
+            self.enter(Phase::Patrol, now);
+            return GoalStatus::Running;
+        }
         let dead = ctx.state.units.get(&target).map(|u| u.dead());
         match ctx.combat.status() {
             CombatStatus::TargetDead { obj } if obj == target => {
@@ -808,6 +1146,11 @@ fn reason_word(r: LostReason) -> &'static str {
     }
 }
 
+fn near_rift(assignment: TerritoryAssignment, [x, y, _]: [f32; 3]) -> bool {
+    let [rx, ry] = assignment.site.position;
+    (x - rx).hypot(y - ry) <= RIFT_PATROL_RADIUS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1171,25 @@ mod tests {
         assert!(worth_joining(3_600, 9, 10));
         assert!(!worth_joining(3_600, 10, 10), "the cap is reached");
         assert!(!worth_joining(-5, 0, 10), "a state that ended is no war");
+    }
+
+    #[test]
+    fn rift_patrols_release_opponents_who_retreat_from_the_rally() {
+        let assignment = TerritoryAssignment {
+            site: crate::config::TerritoryPatrol {
+                zone_group: 20,
+                position: [1000.0, 2000.0],
+            },
+            rift: Some((
+                EventId {
+                    def: 3,
+                    zone_group: 20,
+                },
+                500,
+            )),
+        };
+        assert!(near_rift(assignment, [1000.0, 2130.0, 70.0]));
+        assert!(!near_rift(assignment, [1000.0, 2131.0, 70.0]));
     }
 
     #[test]

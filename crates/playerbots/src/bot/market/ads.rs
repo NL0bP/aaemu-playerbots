@@ -86,6 +86,15 @@ pub enum Side {
     Buy,
 }
 
+/// The guild budget or contract approved for a negotiated purchase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Funding {
+    Training(u32),
+    FarmLand(u32),
+    Fishing(u32),
+    SupplyContract(u32, u32),
+}
+
 /// An advertisement of this bot that is standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listing {
@@ -97,6 +106,7 @@ pub struct Listing {
     pub qty: u32,
     /// Prices per unit.
     pub quote: Quote,
+    pub funding: Option<Funding>,
     /// Bot clock it was posted.
     pub posted_ms: u64,
 }
@@ -114,6 +124,7 @@ pub struct Agreed {
     pub qty: u32,
     /// Copper per unit.
     pub unit: u32,
+    pub funding: Option<Funding>,
     /// Where to meet.
     pub meet: Meet,
     /// Bot clock of the agreement.
@@ -168,6 +179,23 @@ pub struct Need {
     pub template: u32,
     /// Units it wants.
     pub qty: u32,
+    /// Fixed price per unit for a guild order.
+    pub order_price: Option<u32>,
+    /// Rank allowance supporting this purchase, if one was budgeted.
+    pub funding: Option<Funding>,
+}
+
+impl Need {
+    pub fn quote(self, prices: &dyn PriceSource) -> Option<Quote> {
+        match self.order_price {
+            Some(price) => Some(Quote {
+                ask: price,
+                floor: price,
+                ceiling: price,
+            }),
+            None => prices.quote(self.template),
+        }
+    }
 }
 
 /// The limits and switches of one step.
@@ -209,6 +237,10 @@ pub struct Env<'a> {
     pub audience: usize,
     /// Whether a character is one of our bots.
     pub is_bot: &'a dyn Fn(&str) -> bool,
+    /// Whether a seller is eligible for the approved funding.
+    pub permits_supplier: &'a dyn Fn(Option<Funding>, &str) -> bool,
+    /// Whether the seller knows this buyer as a trusted companion.
+    pub trusted_companion: &'a dyn Fn(&str) -> bool,
     /// How much of an advertised item the bot wants and what it pays at most per unit, given the
     /// template, the units offered and the asking price.
     pub interest: &'a dyn Fn(u32, u32, u32) -> Option<(u32, u32)>,
@@ -543,7 +575,12 @@ impl AdState {
                     return;
                 }
                 let free = l.qty;
-                let mut t = Talk::seller(&h.sender, medium, l.template, free, l.quote, env.now_ms);
+                let quote = if medium == Medium::Whisper && (env.trusted_companion)(&h.sender) {
+                    l.quote.for_companion()
+                } else {
+                    l.quote
+                };
+                let mut t = Talk::seller(&h.sender, medium, l.template, free, quote, env.now_ms);
                 if self.deal.is_some() {
                     self.say(env, medium, &h.sender, Speech::Decline(Decline::SoldOut));
                     return;
@@ -552,6 +589,9 @@ impl AdState {
                 self.keep(t, reply, medium, env);
             }
             Side::Buy => {
+                if !(env.permits_supplier)(l.funding, &h.sender) {
+                    return;
+                }
                 // somebody answers "WTB": what do they have, at what price
                 let mut t = Talk::buyer(
                     &h.sender,
@@ -561,6 +601,7 @@ impl AdState {
                     l.quote.ceiling,
                     env.now_ms,
                 );
+                t.funding = l.funding;
                 let reply = t.on_line(&h.line, medium, env.now_ms, &mut *env.place);
                 self.keep(t, reply, medium, env);
             }
@@ -602,6 +643,14 @@ impl AdState {
         }
         if h.line.sell_ad {
             // goods for sale: do we want them?
+            let funding = env
+                .needs
+                .iter()
+                .find(|need| need.template == template)
+                .and_then(|need| need.funding);
+            if !(env.permits_supplier)(funding, &h.sender) {
+                return;
+            }
             let Some((want, ceiling)) = (env.interest)(template, qty, unit) else {
                 return;
             };
@@ -613,6 +662,7 @@ impl AdState {
                 ceiling,
                 env.now_ms,
             );
+            t.funding = funding;
             let ask_first = env.rng.u8(..100) < ASK_FIRST_PERCENT;
             let speech = t.open_as_buyer(unit, ask_first);
             if speech.is_some() {
@@ -650,6 +700,10 @@ impl AdState {
     }
 
     fn talk_line(&mut self, i: usize, h: &Heard, medium: Medium, may: bool, env: &mut Env<'_>) {
+        if !(env.permits_supplier)(self.talks[i].funding, &h.sender) {
+            self.talks[i].close(Closed::Declined);
+            return;
+        }
         if self.talks[i].role == Role::Seller && !may {
             self.talks[i].close(Closed::Declined);
             self.say(env, medium, &h.sender, Speech::Decline(Decline::SoldOut));
@@ -704,6 +758,7 @@ impl AdState {
             template: t.template,
             qty: t.qty,
             unit: t.unit,
+            funding: t.funding,
             meet,
             at_ms: env.now_ms,
         });
@@ -731,8 +786,14 @@ impl AdState {
         }
         // what to say: goods for sale first, what the bot needs now and then
         let wants_buy = !env.needs.is_empty() && env.money >= 500;
+        let contract = wants_buy
+            && env
+                .needs
+                .iter()
+                .any(|need| matches!(need.funding, Some(Funding::SupplyContract(..))));
         let sell = self.best_surplus(env);
         let side_sell = match (sell.is_some(), wants_buy) {
+            (true, true) if contract => false,
             (true, true) => env.rng.u8(..100) < 70,
             (true, false) => true,
             (false, true) => false,
@@ -752,10 +813,19 @@ impl AdState {
             self.next_ad_ms = now + env.rules.ad_interval_ms.max(60_000) / 4;
             return;
         }
-        let spread = i32::try_from(env.rng.u32(0..21)).unwrap_or(10) - 10;
+        let need = (side == Side::Buy)
+            .then(|| env.needs.iter().find(|need| need.template == template))
+            .flatten();
+        let fixed_price = need.is_some_and(|need| need.order_price.is_some());
+        let spread = if fixed_price {
+            0
+        } else {
+            i32::try_from(env.rng.u32(0..21)).unwrap_or(10) - 10
+        };
         let q = quote.spread(spread);
         let (quote, price) = match side {
             Side::Sell => (q, q.ask),
+            Side::Buy if fixed_price => (q, q.ask),
             // a wanted-ad names what the bot pays; it may go a little over when haggled
             Side::Buy => (
                 Quote {
@@ -771,6 +841,7 @@ impl AdState {
             template,
             qty,
             quote,
+            funding: need.and_then(|need| need.funding),
             posted_ms: now,
         };
         let speech = match side {
@@ -810,14 +881,27 @@ impl AdState {
 
     /// What the bot would like to buy: `(template, units, quote)`.
     fn best_need(&self, env: &mut Env<'_>) -> Option<(u32, u32, Quote)> {
-        let pick = env.rng.usize(..env.needs.len().max(1));
-        let n = env.needs.get(pick)?;
-        let q = env.prices.quote(n.template)?;
-        // never plan to spend more than a third of the purse
-        let afford =
-            u32::try_from((env.money / 3 / i64::from(q.ceiling.max(1))).max(0)).unwrap_or(u32::MAX);
-        let qty = n.qty.min(afford);
-        (qty > 0).then_some((n.template, qty, q))
+        let affordable = |need: &Need| {
+            let quote = need.quote(env.prices)?;
+            let budget = (env.money / 3 / i64::from(quote.ceiling.max(1))).max(0);
+            let qty = need.qty.min(u32::try_from(budget).unwrap_or(u32::MAX));
+            (qty > 0).then_some((need.template, qty, quote))
+        };
+        if let Some(order) = env
+            .needs
+            .iter()
+            .filter(|need| need.order_price.is_some())
+            .find_map(affordable)
+        {
+            return Some(order);
+        }
+        let index = env.rng.usize(..env.needs.len().max(1));
+        env.needs
+            .iter()
+            .cycle()
+            .skip(index)
+            .take(env.needs.len())
+            .find_map(affordable)
     }
 }
 

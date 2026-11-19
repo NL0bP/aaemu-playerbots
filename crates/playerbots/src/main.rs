@@ -239,15 +239,56 @@ async fn run(
         baked: cfg.data.baked.clone(),
         world: cfg.data.world.clone(),
     };
-    let world = tokio::task::spawn_blocking(move || World::load(&paths))
-        .await
-        .context("the world loader panicked")?
-        .with_context(|| {
-            format!(
-                "loading the world data (data.compact = {})",
-                cfg.data.compact.display()
-            )
-        })?;
+    let orders_cfg = cfg.clone();
+    let world = tokio::task::spawn_blocking(move || {
+        use playerbots::bot::goals::work::Order;
+        use playerbots::bot::guild::profession::Profession;
+
+        let orders = orders_cfg
+            .guild
+            .orders()
+            .filter(|_| orders_cfg.guild.enabled);
+        let gather = orders.clone().filter_map(|order| match order {
+            Order::Gather { item, .. } => Some(*item),
+            _ => None,
+        });
+        let hunt = orders.filter_map(|order| match order {
+            Order::Hunt { item, .. } => Some(*item),
+            _ => None,
+        });
+        let dispatch = |profession| {
+            orders_cfg.guild.enabled
+                && orders_cfg.guild.dispatch_orders
+                && orders_cfg
+                    .guild
+                    .professions
+                    .values()
+                    .any(|&configured| configured == profession)
+        };
+        World::load_with_work_catalog(
+            &paths,
+            gather,
+            hunt,
+            dispatch(Profession::Gatherer),
+            dispatch(Profession::Adventurer),
+        )
+    })
+    .await
+    .context("the world loader panicked")?
+    .with_context(|| {
+        format!(
+            "loading the world data (data.compact = {})",
+            cfg.data.compact.display()
+        )
+    })?;
+    if cfg.guild.enabled {
+        for (guild, &recipe) in &cfg.guild.trade_pack_orders {
+            anyhow::ensure!(
+                world.craft(recipe).is_some_and(|craft| craft.is_pack),
+                "Trader guild {guild} has an unknown trade pack recipe {recipe}"
+            );
+        }
+    }
     let world = Arc::new(world);
 
     let roster_path = cfg.bots.roster.clone();

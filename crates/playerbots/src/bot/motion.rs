@@ -55,10 +55,6 @@ const MAX_STEP_MS: u64 = 1000;
 const FACE_EPSILON: f32 = 0.09;
 /// The server's idea of the position may be this far off before [`Motion::pin`] corrects it.
 const PIN_EPSILON_M: f32 = 0.15;
-/// A moving update is due this many ms before its gap is over: the timer of the bot loop wakes a
-/// little late or early, and a tick that just misses the gap must not skip an update (which
-/// would double the next gap).
-const SEND_SLACK_MS: u64 = 20;
 
 /// Where the ground is. [`aa_world::World`] answers from the baked height grid.
 pub trait Ground {
@@ -271,6 +267,8 @@ enum TripMode {
     },
     /// Flying down a ledge (boxed: a `Motion` is part of every `Bot` and must stay small).
     Glide(Box<Glide>),
+    /// Walking or swimming around the observed surface of a freshwater fishing school.
+    Freshwater(Box<LocalWater>),
 }
 
 /// Longest a glide may last, ms (the glide buff in the 1.2 data is 180 s; the bot is
@@ -281,6 +279,22 @@ const MAX_GLIDE_MS: u64 = 30_000;
 const GLIDE_RUN_UP_MS: u64 = 2_000;
 /// Height above the ground from which the bot counts as airborne (metres).
 const GLIDE_AIRBORNE_M: f32 = 0.5;
+/// A hooked fish can lead the bot this far across a freshwater lake.
+const FRESHWATER_RADIUS_M: f32 = 250.0;
+
+/// A surface observed at a fishing school. It applies only to a short stretch of water
+/// around the cast, so it cannot change elevations along the trip to a fish stand.
+#[derive(Debug)]
+struct LocalWater {
+    center: [f32; 3],
+}
+
+impl LocalWater {
+    fn swim_z(&self, pos: [f32; 3]) -> Option<f32> {
+        (dist2d(pos, self.center) <= FRESHWATER_RADIUS_M)
+            .then_some(self.center[2] - (SEA_LEVEL - SWIM_Z))
+    }
+}
 
 /// The movement controller of one bot. See the module docs.
 #[derive(Debug)]
@@ -341,6 +355,21 @@ impl Motion {
             nav: None,
             life: None,
         }
+    }
+
+    pub fn note_water_surface(&mut self, position: [f32; 3]) {
+        if position[2] > SEA_LEVEL
+            && position.iter().all(|coord| coord.is_finite())
+            && matches!(self.mode, TripMode::None | TripMode::Freshwater(_))
+        {
+            self.mode = TripMode::Freshwater(Box::new(LocalWater { center: position }));
+        }
+    }
+
+    fn is_swimming(&self) -> bool {
+        self.pos[2] == SWIM_Z
+            || matches!(&self.mode, TripMode::Freshwater(water)
+                if water.swim_z(self.pos) == Some(self.pos[2]))
     }
 
     /// Makes the bot move like a person (see [`super::manner`]). Without it the controller walks
@@ -407,6 +436,23 @@ impl Motion {
             .as_ref()?
             .wake_at(now_ms)
             .map(|t| t.saturating_sub(now_ms))
+    }
+
+    /// Deadline of the next ordinary movement packet. An intervening brain tick does not move
+    /// it. If a tick could not move (for example, a waypoint has zero length), wait a full
+    /// period before retrying.
+    pub fn move_due_ms(&self, period_ms: u64) -> Option<u64> {
+        (self.is_moving()
+            && self.moving_sent
+            && !self.life.as_deref().is_some_and(|l| l.jump.is_some()))
+        .then(|| {
+            let due = self.last_send_ms + period_ms;
+            if due <= self.last_tick_ms {
+                self.last_tick_ms + period_ms
+            } else {
+                due
+            }
+        })
     }
 
     /// The idle mannerisms of a bot that stands and may show off: a turn on the spot, now and
@@ -646,7 +692,9 @@ impl Motion {
         );
         self.radius = radius.max(0.0);
         self.pace = pace;
-        self.mode = TripMode::None;
+        if !matches!(self.mode, TripMode::Freshwater(_)) {
+            self.mode = TripMode::None;
+        }
         self.started_ms = now_ms;
         self.stuck.reset(now_ms, self.pos);
         self.force_send = true;
@@ -798,7 +846,9 @@ impl Motion {
             l.pause_until_ms = 0;
         }
         self.path.clear();
-        self.mode = TripMode::None;
+        if !matches!(self.mode, TripMode::Freshwater(_)) {
+            self.mode = TripMode::None;
+        }
         self.status = MotionStatus::Idle;
         let pos = self.pos;
         if let Some(n) = self.nav.as_deref_mut() {
@@ -946,7 +996,7 @@ impl Motion {
             || l.emotes.sitting
             || env.combat
             || !matches!(self.mode, TripMode::None)
-            || self.pos[2] == SWIM_Z
+            || self.is_swimming()
             || env.out.iter().any(range_checked)
         {
             return;
@@ -999,7 +1049,7 @@ impl Motion {
                 self.mode = TripMode::None;
             }
             TripMode::Glide(_) => return self.glide_tick(env, dt_ms),
-            TripMode::None => {}
+            TripMode::None | TripMode::Freshwater(_) => {}
         }
         if self.path.is_empty() {
             if self.stop_due {
@@ -1058,6 +1108,19 @@ impl Motion {
             Some(NavOutcome::Moved { heading, speed }) => (heading, speed),
             None => self.walk_straight(env, dt_ms),
         };
+        if let TripMode::Freshwater(water) = &self.mode {
+            if let Some(swim_z) = water.swim_z(self.pos) {
+                if env
+                    .ground
+                    .ground_z(self.pos[0], self.pos[1])
+                    .is_some_and(|ground| ground < swim_z && self.pos[2] <= water.center[2])
+                {
+                    self.pos[2] = swim_z;
+                }
+            } else {
+                self.mode = TripMode::None;
+            }
+        }
         if heading != (0.0, 0.0) {
             self.yaw = cs::yaw_towards((0.0, 0.0), heading);
         }
@@ -1091,10 +1154,8 @@ impl Motion {
             }
             return;
         }
-        // (the loop ticks a walker in view every gap, so every such tick sends: evenly paced)
         let since = now.saturating_sub(self.last_send_ms);
-        let due =
-            self.force_send || !self.moving_sent || since + SEND_SLACK_MS >= env.send_gap_ms.max(1);
+        let due = self.force_send || !self.moving_sent || since >= env.send_gap_ms.max(1);
         if due {
             self.send(env, true, vel);
         }
@@ -1246,7 +1307,7 @@ impl Motion {
         self.status = MotionStatus::Moving;
         let due = self.force_send
             || !self.moving_sent
-            || now.saturating_sub(self.last_send_ms) + SEND_SLACK_MS >= env.send_gap_ms.max(1);
+            || now.saturating_sub(self.last_send_ms) >= env.send_gap_ms.max(1);
         if due {
             let packet = self.packet(now, env.combat, true, (dir.0 * speed, dir.1 * speed), None);
             env.out.push(packet);
@@ -1397,6 +1458,14 @@ impl Motion {
     /// Queues one `CSMoveUnit` on the ground and updates the bookkeeping. A ground update ends
     /// a jump in progress (the bot lands where it is).
     fn send(&mut self, env: &mut MotionEnv<'_>, moving: bool, vel: (f32, f32)) {
+        tracing::trace!(
+            target: "pb_move",
+            obj = self.move_obj(),
+            t_ms = env.now_ms,
+            gap_ms = env.send_gap_ms,
+            moving,
+            "bot movement queued"
+        );
         self.life_end_jump();
         let packet = self.packet(env.now_ms, env.combat, moving, vel, None);
         env.out.push(packet);
@@ -1412,7 +1481,7 @@ impl Motion {
         vel: (f32, f32),
         air: Option<AirStep>,
     ) -> Out {
-        let swimming = self.pos[2] == SWIM_Z;
+        let swimming = self.is_swimming();
         let gliding = self.gliding();
         let (lift, vz, jump) = if let TripMode::Glide(g) = &self.mode {
             (0.0, -g.descent, cs::JumpPhase::Air)
@@ -1878,6 +1947,27 @@ mod tests {
     }
 
     #[test]
+    fn freshwater_surface_lets_the_bot_swim_above_the_lakebed() {
+        let ground = |x: f32, _: f32| Some(if x < 15.0 { 131.0 } else { 119.0 });
+        let mut rig = Rig::new([10.0, 10.0, 131.0]);
+        rig.motion.note_water_surface([25.0, 10.0, 129.0]);
+        rig.motion.go_to(35.0, 10.0, 0.0, Pace::Run, rig.now);
+        while rig.tick(&ground, 250, 250) == MotionStatus::Moving {}
+        assert_eq!(rig.motion.pos()[2], 127.5);
+        assert!(rig.motion.is_swimming());
+
+        rig.motion.go_to(140.0, 10.0, 0.0, Pace::Run, rig.now);
+        while rig.tick(&ground, 250, 250) == MotionStatus::Moving {}
+        assert_eq!(rig.motion.pos()[2], 127.5);
+        assert!(rig.motion.is_swimming());
+
+        rig.motion.go_to(280.0, 10.0, 0.0, Pace::Run, rig.now);
+        while rig.tick(&ground, 250, 250) == MotionStatus::Moving {}
+        assert_eq!(rig.motion.pos()[2], 119.0);
+        assert!(!rig.motion.is_swimming());
+    }
+
+    #[test]
     fn the_send_rate_drops_when_nobody_watches() {
         let t = ramp();
         let count = |gap: u64| {
@@ -1895,22 +1985,22 @@ mod tests {
     }
 
     /// A walker a real player can see is ticked every `move_update_ms` and sends an update on
-    /// every tick, evenly, also when the timer wakes it a few ms early or late; the position of
+    /// its deadline, even with intervening brain ticks and timer jitter. The position of
     /// each update is where the one before said the bot would be.
     #[test]
     fn a_walker_in_view_sends_evenly_paced_updates_that_agree_with_each_other() {
         let t = ramp();
         let mut rig = Rig::new([10.0, 10.0, 121.0]);
         rig.motion.go_to(400.0, 10.0, 0.0, Pace::Run, rig.now);
-        let mut times = Vec::new();
+        rig.tick(&t, 125, 125);
         for i in 0..80u64 {
-            // 125 ms on average, the timer off by up to 8 ms either way
-            let dt = 125 + (i % 3) * 8 - 8;
-            rig.tick(&t, dt, 125);
-            times.push(rig.now);
+            let due = rig.motion.move_due_ms(125).unwrap();
+            rig.tick(&t, 60, 125); // the brain wakes first
+            assert_eq!(rig.motion.move_due_ms(125), Some(due));
+            rig.tick(&t, due - rig.now + (i % 3) * 4, 125);
         }
         let moving: Vec<&Out> = rig.out.iter().filter(|p| flags(p) == 0x02).collect();
-        assert_eq!(moving.len(), 80, "an update on every tick");
+        assert_eq!(moving.len(), 81, "an update at each movement deadline");
         let read = |p: &Out| {
             let mut s = aa_proto::PacketStream::from_bytes(p.body.clone());
             s.read_bc().unwrap();
@@ -1925,7 +2015,7 @@ mod tests {
             let (t0, x0, _, vx) = read(w[0]);
             let (t1, x1, _, _) = read(w[1]);
             let dt = (t1 - t0) as f32 / 1000.0;
-            assert!((117..=133).contains(&(t1 - t0)), "{}", t1 - t0);
+            assert!((125..=133).contains(&(t1 - t0)), "{}", t1 - t0);
             // (dead reckoning from the update before: within the position's wire precision)
             assert!((x0 + vx * dt - x1).abs() < 0.05, "{x0} {vx} {dt} {x1}");
         }

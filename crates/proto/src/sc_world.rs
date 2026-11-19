@@ -210,6 +210,8 @@ pub struct UnitInfo {
     pub owner_id: u32,
     /// Transport-layer id of slaves, houses, transfers and mates; 0 otherwise.
     pub tl_id: u16,
+    /// Parent object of an attached slave. Its position is relative to this object.
+    pub slave_parent: u32,
     /// Position.
     pub pos: Pos,
     /// Level.
@@ -257,6 +259,8 @@ pub struct DoodadInfo {
     pub phase: u32,
     /// Owner character id (0 = none).
     pub owner_id: u32,
+    /// Creation time in Unix seconds, or 0 when unavailable.
+    pub plant_time: u32,
     /// Quest glow value (non-zero = highlighted for a quest).
     pub quest_glow: u32,
     /// The doodad has an item to loot.
@@ -293,6 +297,8 @@ pub struct InvItem {
     pub grade: u8,
     /// Stack count.
     pub count: i32,
+    /// Treasure map east and north coordinates in 1/4096-metre units.
+    pub treasure: Option<[i64; 2]>,
 }
 
 /// One task of an `SCItemTaskSuccessPacket` (`ItemAction`, models/item_task.rs:127).
@@ -331,6 +337,8 @@ pub enum ItemChange {
         grade: u8,
         /// Stack count.
         count: i32,
+        /// Treasure map east and north coordinates in 1/4096-metre units.
+        treasure: Option<[i64; 2]>,
     },
     /// A stack changed by `delta` (action 4).
     CountUpdate {
@@ -892,6 +900,8 @@ pub enum WorldEvent {
         /// The grade after.
         after: u8,
     },
+    /// Proficiency points sent on login by `SCActabilityPacket` (packets/world.rs).
+    Actabilities(Box<[(u32, i32)]>),
     /// `SCCharacterLaborPowerChangedPacket` (systems/skills/progress.rs:35).
     LaborChanged {
         /// Labor delta (negative = spent).
@@ -1186,6 +1196,7 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCItemTaskSuccessPacket => read_item_task,
         sc::SCItemSocketingLunagemResultPacket => read_lunagem_result,
         sc::SCGradeEnchantResultPacket => read_grade_enchant_result,
+        sc::SCActabilityPacket => read_actabilities,
         sc::SCCharacterLaborPowerChangedPacket => read_labor_changed,
         sc::SCSkillLearnedPacket => |s| read_skill_learned(s, false),
         sc::SCSkillUpgradedPacket => |s| read_skill_learned(s, true),
@@ -1293,10 +1304,12 @@ struct ItemRec {
     count: i32,
     /// Lunagems socketed (equipment details only, else 0).
     gems: u8,
+    treasure: Option<[i64; 2]>,
 }
 
 /// `ItemDetailType.Equipment`: the detail block of gear (models/item.rs:24).
 const DETAIL_EQUIPMENT: u8 = 1;
+const DETAIL_TREASURE_MAP: u8 = 5;
 /// Where the seven gem template ids start in the equipment detail body (after the image item,
 /// durability, an `i16`, the lunastone, the charge time and the dye: `4 + 1 + 2 + 4 + 8 + 4`,
 /// models/item.rs:603 `write_details`).
@@ -1316,18 +1329,25 @@ fn gems_in(body: &[u8]) -> u8 {
     })
 }
 
-/// Reads the detail body of `detail` type and returns the gems of an equipment detail.
-fn read_detail_body(s: &mut PacketStream, detail: u8) -> Res<u8> {
+fn treasure_in(body: &[u8]) -> Option<[i64; 2]> {
+    let east = i64::from_le_bytes(body.get(8..16)?.try_into().ok()?);
+    let north = i64::from_le_bytes(body.get(16..24)?.try_into().ok()?);
+    (east > 0 && north > 0).then_some([east, north])
+}
+
+/// Reads the type-specific item detail and keeps the facts used by the bot.
+fn read_detail_body(s: &mut PacketStream, detail: u8) -> Res<(u8, Option<[i64; 2]>)> {
     let Some(&len) = DETAIL_BODY_LENS.get(usize::from(detail)) else {
         return invalid(format!("unknown item detail type {detail}"));
     };
-    if detail != DETAIL_EQUIPMENT {
-        skip(s, len)?;
-        return Ok(0);
-    }
     let at = s.pos();
     skip(s, len)?;
-    Ok(gems_in(&s.as_bytes()[at..at + len]))
+    let body = &s.as_bytes()[at..at + len];
+    Ok(match detail {
+        DETAIL_EQUIPMENT => (gems_in(body), None),
+        DETAIL_TREASURE_MAP => (0, treasure_in(body)),
+        _ => (0, None),
+    })
 }
 
 /// `Item.Write` (models/item.rs:1061) after the template id: id, grade, flags, count, the typed
@@ -1338,7 +1358,7 @@ fn read_item_body(s: &mut PacketStream, template: u32) -> Res<ItemRec> {
     s.read_u8()?; // flags
     let count = s.read_i32()?;
     let detail = s.read_u8()?;
-    let gems = read_detail_body(s, detail)?;
+    let (gems, treasure) = read_detail_body(s, detail)?;
     skip(s, 8 + 4 + 4 + 1 + 8 + 8)?; // create time, lifespan, made unit, world id, unsecure, unpack
     Ok(ItemRec {
         template,
@@ -1346,6 +1366,7 @@ fn read_item_body(s: &mut PacketStream, template: u32) -> Res<ItemRec> {
         grade,
         count,
         gems,
+        treasure,
     })
 }
 
@@ -1736,6 +1757,7 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         owner_name,
         owner_id,
         tl_id,
+        slave_parent: 0,
         pos,
         level,
         hp,
@@ -1768,7 +1790,7 @@ fn read_unit_tail(s: &mut PacketStream, unit: &mut UnitInfo) -> Res<()> {
     match ty {
         unit_type::SLAVE => {
             if s.read_i8()? > -1 {
-                skip(s, 3)?; // owner object
+                unit.slave_parent = s.read_bc()?;
             }
         }
         unit_type::TRANSFER => {
@@ -2109,7 +2131,8 @@ fn read_doodad(s: &mut PacketStream) -> Res<DoodadInfo> {
     let has_loot = s.read_bool()?;
     let phase = s.read_u32()?;
     let owner_id = s.read_u32()?;
-    skip(s, 8 + 4 + 4 + 4 + 8)?; // ucc id, item template, type2, time left, plant time
+    skip(s, 8 + 4 + 4 + 4)?; // ucc id, item template, type2, time left
+    let plant_time = u32::try_from(s.read_i64()?).unwrap_or(0);
     let quest_glow = s.read_u32()?;
     skip(s, 4 + 4 + 1 + 4 + 4)?; // family, puzzle group, owner type, owner db id, data
     Ok(DoodadInfo {
@@ -2120,6 +2143,7 @@ fn read_doodad(s: &mut PacketStream) -> Res<DoodadInfo> {
         parent_obj,
         phase,
         owner_id,
+        plant_time,
         quest_glow,
         has_loot,
     })
@@ -2222,6 +2246,7 @@ fn read_inventory(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
                 template: item.template,
                 grade: item.grade,
                 count: item.count,
+                treasure: item.treasure,
             });
         }
         slot = slot.saturating_add(1);
@@ -2233,23 +2258,13 @@ fn read_inventory(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     })
 }
 
-/// Reads the `(short)128`-prefixed detail block of an item task and skips it.
-fn skip_task_details(s: &mut PacketStream) -> Res<()> {
-    let len = usize::try_from(s.read_i16()?).unwrap_or(0);
-    skip(s, len)
-}
-
 /// Reads the `(short)128`-prefixed detail block of an item task (`write_padded_details`,
-/// models/item_task.rs:374: the detail type, the details, zero padding): the gems of an equipment
-/// detail, `None` for other details.
-fn read_task_detail_gems(s: &mut PacketStream) -> Res<Option<u8>> {
+/// models/item_task.rs:374: the detail type, the details, zero padding).
+fn read_task_details(s: &mut PacketStream) -> Res<&[u8]> {
     let len = usize::try_from(s.read_i16()?).unwrap_or(0);
     let at = s.pos();
     skip(s, len)?;
-    Ok(match s.as_bytes()[at..at + len].split_first() {
-        Some((&DETAIL_EQUIPMENT, body)) => Some(gems_in(body)),
-        _ => None,
-    })
+    Ok(&s.as_bytes()[at..at + len])
 }
 
 fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
@@ -2273,7 +2288,10 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
             let grade = s.read_u8()?;
             skip(s, 1)?; // flags
             let count = s.read_i32()?;
-            skip_task_details(s)?;
+            let treasure = match read_task_details(s)?.split_first() {
+                Some((&DETAIL_TREASURE_MAP, body)) => treasure_in(body),
+                _ => None,
+            };
             skip(s, 8 + 4 + 4 + 1 + 8 + 8)?; // create time, lifespan, made unit, world, times
             ItemChange::Added {
                 action,
@@ -2283,6 +2301,7 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
                 id,
                 grade,
                 count,
+                treasure,
             }
         }
         4 => {
@@ -2344,7 +2363,10 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
-            let gems = read_task_detail_gems(s)?;
+            let gems = match read_task_details(s)?.split_first() {
+                Some((&DETAIL_EQUIPMENT, body)) => Some(gems_in(body)),
+                _ => None,
+            };
             ItemChange::Updated {
                 slot_type,
                 slot,
@@ -2446,6 +2468,18 @@ pub(crate) fn read_item_task_info(s: &mut PacketStream) -> Res<ItemTaskInfo> {
         changes,
         force_removed,
     })
+}
+
+fn read_actabilities(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let _last = s.read_bool()?;
+    let count = usize::from(s.read_u8()?);
+    check_count(s, count, 9, "actabilities")?;
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        points.push((s.read_u32()?, s.read_i32()?));
+        let _step = s.read_u8()?;
+    }
+    some(WorldEvent::Actabilities(points.into_boxed_slice()))
 }
 
 fn read_labor_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {

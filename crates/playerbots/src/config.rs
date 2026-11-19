@@ -265,6 +265,16 @@ pub struct BehaviorCfg {
     pub jump_rate: f32,
     /// Bots use emotes (a wave, a bow, a sit) in life-like moments. Off: no emotes.
     pub emotes: bool,
+    /// Idle wander goals sometimes visit a nearby settlement market.
+    pub settlement_visits: bool,
+    /// World coordinates of benches, taverns, fires or other settlement gathering spots.
+    pub settlement_hangouts: Vec<[f32; 2]>,
+    /// Sport fish near active schools and sell the caught packs.
+    pub sport_fishing: bool,
+    /// Accept nearby player whispers for delivery, scouting, and mediation.
+    pub delivery_contracts: bool,
+    /// Form bot-only open-world parties.
+    pub field_parties: bool,
 }
 
 impl Default for BehaviorCfg {
@@ -288,6 +298,11 @@ impl Default for BehaviorCfg {
             lifelike: true,
             jump_rate: 1.0,
             emotes: true,
+            settlement_visits: false,
+            settlement_hangouts: Vec::new(),
+            sport_fishing: false,
+            delivery_contracts: false,
+            field_parties: false,
         }
     }
 }
@@ -465,6 +480,10 @@ pub struct SailCfg {
     /// `schooner` or `auto`. With `bots.gm_bootstrap` a bot gets the scroll with the GM
     /// `/item add` command; without, it needs the scroll in its bag.
     pub ship: ShipChoice,
+    /// Allow Trader guild members to sail their own boats with packs to other continents.
+    pub trade_passages: bool,
+    /// Allow Thief guild members with armed ships and ammo to fire on hostile ships at war.
+    pub naval_raids: bool,
 }
 
 /// `[mounts]`: the owned mount and glider a bot uses on long trips (switched on and off by
@@ -582,6 +601,63 @@ impl Default for MarketCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GuildCfg {
+    /// Server guild ID (a decimal string in TOML) to its profession.
+    pub professions: std::collections::BTreeMap<String, crate::bot::guild::profession::Profession>,
+    /// Same-profession guilds whose eligible members take priority on a war patrol.
+    pub war_rivals: std::collections::BTreeMap<String, Vec<u32>>,
+    /// Potato guild ID to the seed or produce item members should grow.
+    pub farm_orders: std::collections::BTreeMap<String, u32>,
+    /// Seed items a Potato guild compares using confirmed market prices.
+    pub farm_choices: std::collections::BTreeMap<String, Vec<u32>>,
+    /// Native guild-shared properties whose owner leases planting space to members.
+    pub farm_leases: std::collections::BTreeMap<String, Vec<FarmLease>>,
+    /// Trader guild members may buy one lot for resale against confirmed market prices.
+    pub auction_flips: bool,
+    /// Repeatable crafting and gathering orders by guild ID.
+    pub production_orders: std::collections::BTreeMap<String, crate::bot::goals::work::Order>,
+    /// Guildmaster bots can update their members' production orders by whisper.
+    pub dispatch_orders: bool,
+    /// Production specialties by guild ID and character ID, overriding the guild-wide order.
+    pub member_production_orders: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::bot::goals::work::Order>,
+    >,
+    /// Accept player commissions for a Crafter's configured recipe.
+    pub player_craft_orders: bool,
+    /// Maximum copper a member may pay for one customer's recipe inputs. Zero disables purchases.
+    pub player_craft_material_max_copper: u32,
+    /// Pack recipes Trader guild members provision and run.
+    pub trade_pack_orders: std::collections::BTreeMap<String, u32>,
+    /// Let Thieves and Bounty Hunters hunt treasure with owned maps and keys.
+    pub treasure_hunts: bool,
+    /// Contributions paid to the current bot guildmaster, by server guild ID.
+    pub treasuries: std::collections::BTreeMap<String, crate::bot::guild::treasury::Terms>,
+    /// Approved recovery items bought from rank allowances, by guild ID.
+    pub recovery_supplies:
+        std::collections::BTreeMap<String, Vec<crate::bot::guild::recovery::Supply>>,
+    /// Maximum copper per training ingredient, by Crafter guild ID and item template.
+    pub training_material_prices:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, u32>>,
+    /// Maximum copper per tax certificate for a Potato guild member's garden placement.
+    pub farm_tax_prices: std::collections::BTreeMap<String, u32>,
+    /// Maximum copper per sport fishing lure bought from a Gatherer member's rank allowance.
+    pub fishing_lure_prices: std::collections::BTreeMap<String, u32>,
+    /// One finite purchase by a named guildmaster from another configured guild.
+    pub supply_contracts: std::collections::BTreeMap<String, crate::bot::guild::supply::Contract>,
+    /// Guild ids and the dominion zone groups they may help attack or defend.
+    pub siege_zones: std::collections::BTreeMap<String, Vec<u16>>,
+    /// Approved camp placement sites for a bot guildmaster with a siege camp.
+    pub siege_declarations: std::collections::BTreeMap<String, Vec<TerritoryPatrol>>,
+    /// Maximum copper a guildmaster may commit to one authored siege camp auction per cycle.
+    pub siege_camp_bids: std::collections::BTreeMap<String, u32>,
+    /// Optional priority cross-continent pack buyer for a Trader guild.
+    pub voyage_buyers: std::collections::BTreeMap<String, u32>,
+    /// Resource or route sites a castle-holding guild can patrol in active conflict.
+    pub territory_patrols: std::collections::BTreeMap<String, Vec<TerritoryPatrol>>,
+    /// Authored rift definitions a castle-holding guild may patrol during an active war.
+    pub rift_patrols: std::collections::BTreeMap<String, Vec<u32>>,
+    /// Long-run percentage of play that can go to professional goals.
+    pub work_percent: u8,
     /// Master switch of the guild features (goal `guild`). Off: no bot founds, joins or runs a
     /// guild.
     pub enabled: bool,
@@ -601,9 +677,50 @@ pub struct GuildCfg {
     pub churn_per_hour: f32,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerritoryPatrol {
+    pub zone_group: u16,
+    pub position: [f32; 2],
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FarmLease {
+    pub house: u32,
+    #[serde(default)]
+    pub rent_copper: u32,
+}
+
 impl Default for GuildCfg {
     fn default() -> Self {
         Self {
+            professions: Default::default(),
+            war_rivals: Default::default(),
+            farm_orders: Default::default(),
+            farm_choices: Default::default(),
+            farm_leases: Default::default(),
+            auction_flips: false,
+            production_orders: Default::default(),
+            dispatch_orders: false,
+            member_production_orders: Default::default(),
+            player_craft_orders: false,
+            player_craft_material_max_copper: 0,
+            trade_pack_orders: Default::default(),
+            treasure_hunts: false,
+            treasuries: Default::default(),
+            recovery_supplies: Default::default(),
+            training_material_prices: Default::default(),
+            farm_tax_prices: Default::default(),
+            fishing_lure_prices: Default::default(),
+            supply_contracts: Default::default(),
+            siege_zones: Default::default(),
+            siege_declarations: Default::default(),
+            siege_camp_bids: Default::default(),
+            voyage_buyers: Default::default(),
+            territory_patrols: Default::default(),
+            rift_patrols: Default::default(),
+            work_percent: 60,
             enabled: false,
             found: true,
             min_level: 5,
@@ -612,6 +729,29 @@ impl Default for GuildCfg {
             accept_player_invites: false,
             churn_per_hour: 0.2,
         }
+    }
+}
+
+impl GuildCfg {
+    pub fn production_for(
+        &self,
+        guild: u32,
+        character: u32,
+    ) -> Option<crate::bot::goals::work::Order> {
+        let guild = guild.to_string();
+        self.member_production_orders
+            .get(&guild)
+            .and_then(|members| members.get(&character.to_string()))
+            .or_else(|| self.production_orders.get(&guild))
+            .copied()
+    }
+
+    pub fn orders(&self) -> impl Iterator<Item = &crate::bot::goals::work::Order> + Clone {
+        self.production_orders.values().chain(
+            self.member_production_orders
+                .values()
+                .flat_map(|members| members.values()),
+        )
     }
 }
 
@@ -709,6 +849,12 @@ pub struct PartyCfg {
     pub chat_commands: bool,
     /// A bot in a player's party follows it into instance dungeons.
     pub follow_into_dungeons: bool,
+    /// Adventurer guild members take trade-pack escort requests from their party leader.
+    pub trade_escorts: bool,
+    /// Copper agreed before an escort and payable after arrival. Zero keeps escorts free.
+    pub trade_escort_fee_copper: u32,
+    /// Companions ask a player loot master for a share of dungeon and combat loot.
+    pub loot_share_requests: bool,
     /// A bot declines the invitation of a player whose level (when it is known) differs from its
     /// own by more than this.
     pub max_level_gap: u8,
@@ -725,6 +871,9 @@ impl Default for PartyCfg {
             join_player_parties: false,
             chat_commands: false,
             follow_into_dungeons: false,
+            trade_escorts: false,
+            trade_escort_fee_copper: 0,
+            loot_share_requests: false,
             max_level_gap: 10,
             max_companions: 8,
             max_per_player: 4,
@@ -862,6 +1011,8 @@ pub struct FarmCfg {
     pub public_farms: bool,
     /// Bots plant on the land of their own houses.
     pub own_land: bool,
+    /// Potato guild members can raise and tend livestock on protected land.
+    pub husbandry: bool,
     /// A bot plants the seeds a harvest gives back on the spot it harvested.
     pub replant: bool,
     /// The farthest a bot walks to a farm, a vendor or a plot (metres); trips longer than
@@ -892,6 +1043,7 @@ impl Default for FarmCfg {
             growth_rate: 1.0,
             public_farms: true,
             own_land: true,
+            husbandry: false,
             replant: true,
             max_trip_m: 4_000.0,
             wild: false,
@@ -1465,6 +1617,203 @@ impl Config {
         let g = &self.guild;
         ensure!(g.min_level >= 1, "guild.min_level must be at least 1");
         ensure!(
+            g.production_orders.iter().all(|(id, order)| {
+                g.professions
+                    .get(id)
+                    .is_some_and(|profession| order.allowed_in(*profession))
+            }),
+            "guild.production_orders must name a guild with the corresponding profession"
+        );
+        ensure!(
+            g.member_production_orders.iter().all(|(guild, members)| {
+                g.professions.get(guild).is_some_and(|profession| {
+                    members.iter().all(|(character, order)| {
+                        character.parse::<u32>().is_ok_and(|id| id > 0 && id.to_string() == *character)
+                            && order.allowed_in(*profession)
+                    })
+                })
+            }),
+            "guild.member_production_orders must name positive character IDs and matching guild professions"
+        );
+        ensure!(
+            g.trade_pack_orders.iter().all(|(guild, &recipe)| {
+                recipe != 0
+                    && g.professions.get(guild)
+                        == Some(&crate::bot::guild::profession::Profession::Trader)
+            }),
+            "guild.trade_pack_orders must name Trader guilds and nonzero recipes"
+        );
+        ensure!(
+            g.treasuries.len() <= 16
+                && g.treasuries
+                    .iter()
+                    .all(|(id, terms)| {
+                        g.professions.contains_key(id)
+                            && terms.valid()
+                            && (terms.trade_loan_copper == 0 || g.trade_pack_orders.contains_key(id))
+                    }),
+            "guild.treasuries must name up to 16 configured guilds with valid contributions and assigned recipes for trade loans"
+        );
+        ensure!(
+            g.recovery_supplies.iter().all(|(guild, supplies)| {
+                g.professions.get(guild).copied().is_some_and(crate::bot::guild::recovery::supports)
+                    && g.treasuries.get(guild).is_some_and(|terms| terms.weekly_support_copper > 0)
+                    && !supplies.is_empty()
+                    && supplies.len() <= 8
+                    && supplies.iter().all(|supply| supply.valid())
+            }),
+            "guild.recovery_supplies must name guilds with rank allowances and one to eight valid supplies"
+        );
+        ensure!(
+            g.training_material_prices.iter().all(|(guild, prices)| {
+                g.professions.get(guild) == Some(&crate::bot::guild::profession::Profession::Crafter)
+                    && g.treasuries.get(guild).is_some_and(|terms| terms.weekly_support_copper > 0)
+                    && (1..=16).contains(&prices.len())
+                    && prices.iter().all(|(item, price)| {
+                        item.parse::<u32>().is_ok_and(|id| id > 0 && id.to_string() == *item)
+                            && (1..=100_000).contains(price)
+                    })
+            }),
+            "guild.training_material_prices must name Crafter guilds with rank allowances and valid item prices"
+        );
+        ensure!(
+            g.farm_tax_prices.iter().all(|(guild, price)| {
+                g.professions.get(guild) == Some(&crate::bot::guild::profession::Profession::Potato)
+                    && g.treasuries.get(guild).is_some_and(|terms| terms.weekly_support_copper > 0)
+                    && (1..=100_000).contains(price)
+            }),
+            "guild.farm_tax_prices must name Potato guilds with rank allowances and valid certificate prices"
+        );
+        ensure!(
+            g.fishing_lure_prices.iter().all(|(guild, price)| {
+                g.professions.get(guild) == Some(&crate::bot::guild::profession::Profession::Gatherer)
+                    && g.treasuries.get(guild).is_some_and(|terms| terms.weekly_support_copper > 0)
+                    && (1..=100_000).contains(price)
+            }),
+            "guild.fishing_lure_prices must name Gatherer guilds with rank allowances and valid lure prices"
+        );
+        ensure!(
+            g.supply_contracts.iter().all(|(guild, contract)| {
+                guild.parse().is_ok_and(|id| contract.valid(id))
+                    && g.treasuries.contains_key(guild)
+                    && g.professions.contains_key(&contract.supplier.to_string())
+            }),
+            "guild.supply_contracts must name buying guilds with treasuries and different configured supplier guilds"
+        );
+        ensure!(
+            g.war_rivals.iter().all(|(guild, rivals)| {
+                g.professions.get(guild).is_some_and(|role| {
+                    !rivals.is_empty()
+                        && rivals.iter().all(|id| {
+                            let rival = id.to_string();
+                            &rival != guild && g.professions.get(&rival) == Some(role)
+                        })
+                })
+            }),
+            "guild.war_rivals must name different configured guilds with the same profession"
+        );
+        ensure!(
+            g.siege_zones.len() <= 16
+                && g.siege_zones.iter().all(|(guild, zones)| {
+                    guild.parse::<u32>().is_ok_and(|id| id > 0)
+                        && !zones.is_empty()
+                        && zones.len() <= 16
+                        && zones.iter().all(|&zone| zone > 0)
+                }),
+            "guild.siege_zones must name nonzero guild and zone group ids"
+        );
+        ensure!(
+            g.siege_declarations.len() <= 16
+                && g.siege_declarations.iter().all(|(guild, sites)| {
+                    g.siege_zones.get(guild).is_some_and(|groups| {
+                        !sites.is_empty()
+                            && sites.len() <= 6
+                            && sites.iter().all(|site| {
+                                groups.contains(&site.zone_group)
+                                    && site.position.iter().all(|p| p.is_finite())
+                            })
+                    })
+                }),
+            "guild.siege_declarations must give valid sites in the guild's configured siege zones"
+        );
+        ensure!(
+            g.siege_camp_bids.len() <= 16
+                && g.siege_camp_bids.iter().all(|(guild, &cap)| {
+                    g.siege_declarations.contains_key(guild) && cap != 0 && i32::try_from(cap).is_ok()
+                }),
+            "guild.siege_camp_bids must give positive signed copper limits for configured declarers"
+        );
+        ensure!(
+            g.voyage_buyers.len() <= 16
+                && g.voyage_buyers.iter().all(|(guild, buyer)| {
+                    *buyer != 0
+                        && g.professions.get(guild)
+                            == Some(&crate::bot::guild::profession::Profession::Trader)
+                }),
+            "guild.voyage_buyers must name Trader guilds and nonzero pack buyer templates"
+        );
+        ensure!(
+            g.territory_patrols.len() <= 16
+                && g.territory_patrols.iter().all(|(guild, sites)| {
+                    g.siege_zones.contains_key(guild)
+                        && !sites.is_empty()
+                        && sites.len() <= 16
+                        && sites.iter().all(|site| {
+                            site.zone_group != 0 && site.position.iter().all(|p| p.is_finite())
+                        })
+                }),
+            "guild.territory_patrols must name guilds with siege zones and valid patrol sites"
+        );
+        ensure!(
+            g.rift_patrols.len() <= 16
+                && g.rift_patrols.iter().all(|(guild, definitions)| {
+                    g.siege_zones.contains_key(guild)
+                        && !definitions.is_empty()
+                        && definitions.len() <= 16
+                        && definitions.iter().all(|&id| id != 0)
+                }),
+            "guild.rift_patrols must name guilds with siege zones and nonzero event definitions"
+        );
+        ensure!(
+            (50..=75).contains(&g.work_percent),
+            "guild.work_percent must be in 50..=75"
+        );
+        ensure!(
+            g.professions.keys().all(|key| key
+                .parse::<u32>()
+                .is_ok_and(|id| id != 0 && id.to_string() == *key)),
+            "guild.professions keys must be positive numeric guild IDs"
+        );
+        ensure!(
+            g.farm_orders.iter().all(|(id, item)| {
+                *item != 0
+                    && g.professions.get(id)
+                        == Some(&crate::bot::guild::profession::Profession::Potato)
+            }),
+            "guild.farm_orders must name a Potato guild and a nonzero item ID"
+        );
+        ensure!(
+            g.farm_choices.iter().all(|(id, seeds)| {
+                g.professions.get(id) == Some(&crate::bot::guild::profession::Profession::Potato)
+                    && (1..=12).contains(&seeds.len())
+                    && !seeds.contains(&0)
+            }),
+            "guild.farm_choices must name a Potato guild and list 1 to 12 nonzero seed IDs"
+        );
+        ensure!(
+            g.farm_leases.len() <= 16
+                && g.farm_leases.iter().all(|(guild, leases)| {
+                    g.professions.get(guild)
+                        == Some(&crate::bot::guild::profession::Profession::Potato)
+                        && (1..=8).contains(&leases.len())
+                        && leases.iter().all(|lease| {
+                            lease.house != 0
+                                && (lease.rent_copper == 0 || g.treasuries.contains_key(guild))
+                        })
+                }),
+            "guild.farm_leases must name Potato guilds, valid houses and a treasury for paid rents"
+        );
+        ensure!(
             (1..=50).contains(&g.party_size),
             "guild.party_size must be in 1..=50"
         );
@@ -1478,6 +1827,11 @@ impl Config {
             "guild.churn_per_hour must be a number in 0..=60"
         );
         let pt = &self.party;
+        ensure!(
+            pt.trade_escort_fee_copper == 0
+                || (pt.trade_escorts && pt.trade_escort_fee_copper <= 100_000),
+            "party.trade_escort_fee_copper requires trade escorts and must be at most 100,000"
+        );
         ensure!(
             pt.max_level_gap >= 1,
             "party.max_level_gap must be at least 1"
@@ -2274,6 +2628,7 @@ emote = true
         assert_eq!((g.min_level, g.party_size, g.max_guilds), (5, 5, 3));
         let ex = Config::parse(Config::example()).unwrap().guild;
         assert!(!ex.enabled && ex.found && !ex.accept_player_invites);
+        assert!(g.rift_patrols.is_empty() && ex.rift_patrols.is_empty());
         assert_eq!((ex.min_level, ex.party_size, ex.max_guilds), (5, 5, 3));
         assert_documented(
             "guild",
@@ -2298,6 +2653,8 @@ emote = true
         assert_eq!(g.churn_per_hour, 6.0);
         for bad in [
             "[guild]\nfounds = true\n",
+            "[guild]\nrift_patrols = { \"42\" = [3] }\n",
+            "[guild]\nsiege_zones = { \"42\" = [33] }\nrift_patrols = { \"42\" = [0] }\n",
             "[guild]\nenabled = 1\n",
             "[guild]\nmin_level = 0\n",
             "[guild]\nmin_level = 256\n",
@@ -2311,6 +2668,11 @@ emote = true
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+        let patrolling = Config::parse(
+            "[guild]\nsiege_zones = { \"42\" = [33] }\nrift_patrols = { \"42\" = [3] }\n",
+        )
+        .unwrap();
+        assert_eq!(patrolling.guild.rift_patrols["42"], [3]);
     }
 
     #[test]

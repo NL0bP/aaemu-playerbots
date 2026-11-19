@@ -103,6 +103,8 @@ impl Rig {
             money: self.money,
             audience: self.audience,
             is_bot: &is_bot,
+            permits_supplier: &|_, _| true,
+            trusted_companion: &|_| false,
             interest: &interest,
             place: &mut place,
             board: &self.board,
@@ -121,6 +123,34 @@ fn said(ads: &mut AdState, now: u64) -> Vec<Due> {
         }
     }
     out
+}
+
+#[test]
+fn an_unaffordable_order_does_not_block_other_ingredient_ads() {
+    let mut rig = Rig::new("Ann");
+    rig.money = 600;
+    rig.surplus.clear();
+    rig.needs = vec![
+        Need {
+            template: HAY,
+            qty: 6,
+            order_price: Some(500),
+            funding: None,
+        },
+        Need {
+            template: ORE,
+            qty: 12,
+            order_price: Some(20),
+            funding: None,
+        },
+    ];
+    let mut ads = AdState::default();
+    rig.step(&mut ads, 1);
+    let listing = ads.listing.expect("an affordable order");
+    assert_eq!(
+        (listing.template, listing.qty, listing.quote.ask),
+        (ORE, 10, 20)
+    );
 }
 
 #[test]
@@ -229,6 +259,8 @@ fn a_bot_that_needs_goods_posts_a_wanted_ad_it_can_pay() {
     r.needs = vec![Need {
         template: HAY,
         qty: 10,
+        order_price: None,
+        funding: None,
     }];
     let mut a = AdState::default();
     r.step(&mut a, 10_000);
@@ -247,11 +279,54 @@ fn a_bot_that_needs_goods_posts_a_wanted_ad_it_can_pay() {
     r2.needs = vec![Need {
         template: HAY,
         qty: 10,
+        order_price: None,
+        funding: None,
     }];
     r2.money = 100;
     let mut a = AdState::default();
     r2.step(&mut a, 10_000);
     assert!(a.listing().is_none());
+}
+
+#[test]
+fn a_guild_order_posts_the_agreed_price_without_a_random_spread() {
+    let mut r = Rig::new("Ann");
+    r.surplus.clear();
+    r.needs = vec![Need {
+        template: HAY,
+        qty: 3,
+        order_price: Some(90),
+        funding: Some(Funding::Training(42)),
+    }];
+    let mut a = AdState::default();
+    r.step(&mut a, 10_000);
+    let listing = a.listing().expect("posted");
+    assert_eq!(listing.quote.ask, 90);
+    assert_eq!(listing.quote.ceiling, 90);
+    assert_eq!(listing.funding, Some(Funding::Training(42)));
+    let speech = said(&mut a, 10_000);
+    assert!(matches!(
+        speech[0].speech,
+        Speech::AdBuy {
+            unit: 90,
+            qty: 3,
+            ..
+        }
+    ));
+    a.on_chat(-3, "Bob", "I have 3 Hay Bale, 90c each", 20_000);
+    r.step(&mut a, 20_100);
+    r.needs.clear();
+    a.on_chat(
+        -3,
+        "Bob",
+        "deal! 3 Hay Bale for 270c total. meet me on Mirage Isle by the mailbox",
+        30_000,
+    );
+    r.step(&mut a, 30_100);
+    assert_eq!(
+        a.deal().and_then(|deal| deal.funding),
+        Some(Funding::Training(42))
+    );
 }
 
 fn post(r: &mut Rig, a: &mut AdState) {
@@ -530,6 +605,7 @@ fn a_bot_with_its_own_advertisement_still_answers_the_ad_that_matches() {
                 ceiling: 40,
             },
             posted_ms: 1_000,
+            funding: None,
         });
         b.on_chat(
             2,
@@ -563,6 +639,7 @@ fn of_two_sellers_that_want_each_others_goods_only_one_answers() {
             ceiling: 40,
         },
         posted_ms: 1_000,
+        funding: None,
     };
     let answered = |me: &'static str, other: &'static str| {
         let mut n = 0;

@@ -33,7 +33,7 @@ use super::rotation::{
     self, CastKind, Decision, Inputs, LearnCtx, Learner, PartyView, RotState, Rotation, SkillBook,
     TargetView,
 };
-use super::state::{dist2d, Unit, UnitKind};
+use super::state::{dist2d, BotState, Unit, UnitKind, U_MY_SUMMON};
 use super::survival::{self, PullBlock, PullFacts};
 use super::watch::classify::{self, Refusal};
 use super::watch::Finding;
@@ -90,6 +90,12 @@ const GONE_IGNORE_MS: u64 = FIGHT_TIMEOUT_MS + 30_000;
 const OBSTACLE_GIVE_UP: u8 = 4;
 /// After a blocked cast the bot casts nothing for this long while it takes another position.
 const OBSTACLE_HOLD_MS: u64 = 1_500;
+/// The rift's Overpowering Aura allows only skill 24082, which the combat rotation never uses.
+const OVERPOWERING_AURA: u32 = 2104;
+
+pub(super) fn normal_skills_blocked(state: &BotState) -> bool {
+    state.buffs.iter().any(|&(_, id)| id == OVERPOWERING_AURA)
+}
 /// Angle (degrees around the target) of the first position tried after a blocked cast, and what
 /// each further blocked cast adds.
 const SIDESTEP_DEG: (f32, f32) = (50.0, 25.0);
@@ -1019,6 +1025,13 @@ impl Combat {
                     .say(format!("pvp: defending against {}", char_name_of(ctx, obj)));
                 ctx.combat.engage(obj);
                 ctx.combat.defending = obj;
+            } else if let Some(obj) = super::companion::escort::raider(ctx) {
+                ctx.log.say(format!(
+                    "escort: defending the carrier against {}",
+                    char_name_of(ctx, obj)
+                ));
+                ctx.combat.engage(obj);
+                ctx.combat.defending = obj;
             } else if !carrying {
                 if let Some(obj) = pick_assist(ctx, travelling) {
                     // (a team member's fight: help, and share the loot)
@@ -1149,7 +1162,9 @@ impl Combat {
         if std::mem::take(&mut ctx.combat.watch.sidestep) {
             Self::sidestep(ctx, upos, dist);
         }
-        if now < ctx.combat.watch.hold_until_ms {
+        // The aura is refreshed while its source affects us. Resume when the server removes it
+        // instead of cycling through the rotation and basic attack while they are blocked.
+        if now < ctx.combat.watch.hold_until_ms || normal_skills_blocked(ctx.state) {
             if ctx.motion.is_moving() {
                 ctx.motion.face(upos[0], upos[1]);
             }
@@ -1714,7 +1729,7 @@ impl Combat {
 /// Whether a unit is a monster the bot may attack: an NPC the bot's faction is hostile to that no
 /// player owns. Returns its template.
 pub fn attackable<'w>(world: &'w World, own_faction: u32, unit: &Unit) -> Option<&'w NpcTemplate> {
-    if unit.kind != UnitKind::Npc || unit.dead() || unit.owned() {
+    if unit.kind != UnitKind::Npc || unit.dead() || unit.owned() || world.is_sport_fish(unit.id) {
         return None;
     }
     let template = world.npc(unit.id)?;
@@ -1902,7 +1917,7 @@ fn named_attacker(
         let Some(u) = units.get(&obj) else {
             continue;
         };
-        if u.dead() || u.kind != UnitKind::Npc {
+        if u.dead() || u.kind != UnitKind::Npc || u.flags & U_MY_SUMMON != 0 {
             continue;
         }
         let d = u.dist2d(me);

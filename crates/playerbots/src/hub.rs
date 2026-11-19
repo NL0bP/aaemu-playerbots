@@ -65,6 +65,8 @@ pub struct SlotInner {
     pub log: VecDeque<LogLine>,
     /// Quest summary.
     pub quests: Vec<QuestLine>,
+    /// The coordinator order and current quest of an active field party leader.
+    pub field_quest: Option<(u32, u32)>,
     /// Extra rows of the detail panel.
     pub extra: Vec<(String, String)>,
     /// The route the bot is walking, map-plane `[x, y]` points (empty when none). Written by the
@@ -157,6 +159,7 @@ impl BotSlot {
         g.snap.online_secs = 0;
         g.path.clear();
         g.plots.clear();
+        g.field_quest = None;
         self.obj_id.store(0, Ordering::Relaxed);
     }
 }
@@ -393,6 +396,10 @@ pub struct Hub {
     pub pop: Population,
     /// What every bot remembers between runs, see [`crate::journal`].
     pub journal: Arc<crate::journal::JournalBook>,
+    /// Recent confirmed market prices shared across guild members.
+    pub market_prices: crate::bot::guild::prices::Prices,
+    /// Recent, server-confirmed trade-pack attacks eligible for bounty patrols.
+    pub bounties: crate::bot::pvp::bounties::Board,
     /// The log-in and log-out schedules of the bots (owned by the presence feature, see
     /// [`crate::presence`]).
     pub presence: crate::presence::Presence,
@@ -436,6 +443,8 @@ impl Hub {
             llm: p.llm,
             pop: Population::inert(),
             journal: Arc::new(crate::journal::JournalBook::memory()),
+            market_prices: Default::default(),
+            bounties: Default::default(),
             presence: crate::presence::Presence::default(),
             zones: crate::agent::ZoneNames::from_world(p.world),
         }
@@ -450,6 +459,15 @@ impl Hub {
 
     /// The hub with the bots' journal (read at start, written by its saver task).
     pub fn with_journal(mut self, journal: Arc<crate::journal::JournalBook>) -> Hub {
+        let mut sales: Vec<_> = journal
+            .ids()
+            .into_iter()
+            .flat_map(|id| journal.read(id, |j| j.market_sales.clone()))
+            .collect();
+        sales.sort_unstable_by_key(|sale| sale.at_ms);
+        for sale in sales {
+            self.market_prices.remember(sale);
+        }
         self.journal = journal;
         self
     }
@@ -481,6 +499,16 @@ impl Hub {
     /// Whether character `char_id` is one of our bots.
     pub fn is_bot_char(&self, char_id: u32) -> bool {
         self.bot_chars.read().contains(&char_id)
+    }
+
+    pub fn bot_id_of(&self, char_id: u32) -> Option<u32> {
+        if char_id == 0 {
+            return None;
+        }
+        self.slots
+            .read()
+            .iter()
+            .find_map(|(&id, slot)| (slot.char_id.load(Ordering::Relaxed) == char_id).then_some(id))
     }
 
     /// Remembers the character name of one of our bots (also called when a name changes).

@@ -583,6 +583,18 @@ impl Run {
         let Some((d, _)) = self.here(ctx) else { return };
         let (zone_group, now) = (d.zone_group, ctx.now_ms);
         ctx.state.party_mem().note_entry(zone_group, now);
+        if order.is_some() {
+            if let Some(team) = ctx.state.team().filter(|team| team.in_team()) {
+                let me = ctx.state.me.char_id;
+                let now = crate::hub::unix_ms() / 1000;
+                ctx.hub.journal.update(ctx.persona.id, |j| {
+                    for mate in team.remote.iter().filter(|r| r.char_id != me && r.online) {
+                        j.relationships
+                            .update(mate.char_id, |r| r.joined_party(now));
+                    }
+                });
+            }
+        }
         let iw = ctx.world.dungeon_world(d);
         self.listed = iw.map_or(0, |w| {
             w.npcs()

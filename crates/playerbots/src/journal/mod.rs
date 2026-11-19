@@ -24,6 +24,7 @@
 //! [`JournalBook::update`] (`ctx.hub.journal`); both hold one short mutex and never wait for the
 //! disk.
 
+mod companions;
 mod gear;
 mod notes;
 mod seen;
@@ -42,6 +43,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+pub use companions::{DungeonDefeat, Mediation, MediationReply, Preference, Relationships};
 pub use gear::GearNotes;
 pub use notes::{Note, Notes, MAX_NOTES, MAX_NOTE_CHARS};
 pub use seen::{Seen, MAX_ZONES};
@@ -69,6 +71,145 @@ pub struct Journal {
     pub notes: Notes,
     /// What the bot learned about its gear (the gear feature).
     pub gear: GearNotes,
+    /// Server-confirmed membership in a thief guild, retained after departure.
+    pub thief_history: bool,
+    /// Structured memories of characters the bot has played with.
+    pub relationships: Relationships,
+    /// Outstanding request to speak to another bot about a damaged relationship.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediation: Option<Mediation>,
+    /// Last time a player brought this bot a reply to a mediation request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mediation_ms: Option<u64>,
+    /// Number of production orders with a confirmed inventory increase.
+    pub production_completed: u32,
+    /// Number of proficiency-training recipes with a confirmed result.
+    pub production_training_completed: u32,
+    /// The current guildmaster's instruction for this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_dispatch: Option<crate::bot::goals::work::assignment::Dispatch>,
+    /// A customer's pending craft and the stock reserved for the exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub craft_commission: Option<crate::bot::goals::work::customer::Commission>,
+    /// Trade runs by pack item and destination buyer, most recent first.
+    pub trade_routes: Vec<TradeRoute>,
+    /// Sport fishing turn-ins confirmed by equipment removal and purse credit.
+    pub fish_turn_ins: u32,
+    /// Copper received from fish stands.
+    pub fish_sale_copper: u64,
+    /// Outstanding player request and number of messages handed off.
+    pub delivery: Option<crate::bot::goals::delivery::DeliveryOrder>,
+    pub deliveries_completed: u32,
+    pub scouting_reports: u32,
+    /// Trade escorts that reached a buyer with the party leader and cargo.
+    pub escorts_completed: u32,
+    /// Unpaid fee for the most recent completed Adventurer escort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escort_invoice: Option<crate::bot::companion::escort::payment::Invoice>,
+    /// Escort fees confirmed through a trade.
+    pub escort_fees_copper: u64,
+    /// Unpaid commissions and confirmed contributions by server guild.
+    pub guild_treasury: BTreeMap<u32, crate::bot::guild::treasury::Account>,
+    /// Confirmed contracted purchases by server guild.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub guild_supply_receipts: BTreeMap<u32, crate::bot::guild::supply::Receipt>,
+    /// Copper claimed from authenticated guild contribution mail by this guildmaster.
+    pub guild_copper_received: u64,
+    /// Recent sales whose items and copper changed as agreed.
+    pub market_sales: Vec<crate::bot::guild::prices::Receipt>,
+    /// Unsettled resale, including the purchase cost and any confirmed posting fee.
+    pub auction_resale: Option<crate::bot::goals::auction::resale::Resale>,
+    pub auction_resale_profit: i64,
+    /// Places where this bot recovered a pack after a guild ambush.
+    pub raid_sites: Vec<RaidSite>,
+    /// Naval volleys that the server credited with a hit on the selected ship.
+    pub naval_hits: u32,
+    /// Pirate Treasure Chests whose loot was confirmed.
+    pub treasure_chests: u32,
+    /// Server-confirmed kills of characters reported for attacking trade runners.
+    pub bounties_completed: u32,
+    /// Confirmed feed, treatment and collection actions on guild livestock.
+    pub livestock_actions: u32,
+    pub sieges_won: u32,
+    pub sieges_held: u32,
+    pub sieges_declared: u32,
+    /// The server's auction start timestamp for the most recent siege camp bid attempt.
+    pub siege_camp_bid_cycle: i64,
+    /// Earliest wall-clock time when this character can set out for another rift patrol.
+    pub rift_patrol_after_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeRoute {
+    pub item: u32,
+    pub buyer: u32,
+    #[serde(default)]
+    pub sea: bool,
+    pub sales: u32,
+    pub failed_runs: u32,
+    /// Latest gross price estimate, before expenses and mail settlement.
+    pub quoted_copper: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_material_copper: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RaidSite {
+    pub position: [f32; 2],
+    pub recovered: u16,
+}
+
+impl Journal {
+    pub fn note_raid_site(&mut self, position: [f32; 2]) {
+        let index = self.raid_sites.iter().position(|site| {
+            (site.position[0] - position[0]).hypot(site.position[1] - position[1]) <= 150.0
+        });
+        let recovered = index.map_or(1, |index| {
+            self.raid_sites.remove(index).recovered.saturating_add(1)
+        });
+        self.raid_sites.insert(
+            0,
+            RaidSite {
+                position,
+                recovered,
+            },
+        );
+        self.raid_sites.truncate(12);
+    }
+
+    pub fn note_trade_route(
+        &mut self,
+        item: u32,
+        buyer: u32,
+        sea: bool,
+        quote: u32,
+        materials: Option<u32>,
+        sold: bool,
+    ) {
+        let index = self
+            .trade_routes
+            .iter()
+            .position(|r| r.item == item && r.buyer == buyer && r.sea == sea);
+        let mut route = index
+            .map(|i| self.trade_routes.remove(i))
+            .unwrap_or(TradeRoute {
+                item,
+                buyer,
+                sea,
+                ..TradeRoute::default()
+            });
+        route.quoted_copper = quote;
+        if materials.is_some() {
+            route.estimated_material_copper = materials;
+        }
+        if sold {
+            route.sales = route.sales.saturating_add(1);
+        } else {
+            route.failed_runs = route.failed_runs.saturating_add(1);
+        }
+        self.trade_routes.insert(0, route);
+        self.trade_routes.truncate(16);
+    }
 }
 
 #[derive(Serialize, Deserialize)]
